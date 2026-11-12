@@ -1,0 +1,536 @@
+{
+  "version": 1,
+  "author": "Gas Sentinel",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-s3-devkitc-1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {
+        "flashSize": "8"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "title",
+      "top": -190,
+      "left": -300,
+      "attrs": {
+        "text": "NODE3: LPG + CO + environment"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "note",
+      "top": -155,
+      "left": -300,
+      "attrs": {
+        "text": "Relative signals only; NOT ppm / %LEL. Interference knob: center=0"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "lpgLabel",
+      "top": -105,
+      "left": -285,
+      "attrs": {
+        "text": "LPG signal %"
+      }
+    },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "lpg",
+      "top": -75,
+      "left": -285,
+      "attrs": {
+        "value": "35"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "coLabel",
+      "top": -5,
+      "left": -285,
+      "attrs": {
+        "text": "CO signal %"
+      }
+    },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "co",
+      "top": 25,
+      "left": -285,
+      "attrs": {
+        "value": "35"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "tempLabel",
+      "top": 95,
+      "left": -285,
+      "attrs": {
+        "text": "Temperature"
+      }
+    },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "temp",
+      "top": 125,
+      "left": -285,
+      "attrs": {
+        "value": "460"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "humidLabel",
+      "top": 195,
+      "left": -285,
+      "attrs": {
+        "text": "Humidity"
+      }
+    },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "humid",
+      "top": 225,
+      "left": -285,
+      "attrs": {
+        "value": "500"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "interferenceLabel",
+      "top": 295,
+      "left": -285,
+      "attrs": {
+        "text": "LPG interference +/-15%"
+      }
+    },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "interference",
+      "top": 325,
+      "left": -285,
+      "attrs": {
+        "value": "512"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "green",
+      "top": -105,
+      "left": 290,
+      "attrs": {
+        "color": "green"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "amber",
+      "top": -45,
+      "left": 290,
+      "attrs": {
+        "color": "yellow"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "red",
+      "top": 15,
+      "left": 290,
+      "attrs": {
+        "color": "red"
+      }
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "buzzer",
+      "top": 85,
+      "left": 280,
+      "attrs": {
+        "volume": "0.3"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "lpgFault",
+      "top": 165,
+      "left": 275,
+      "attrs": {
+        "color": "red",
+        "label": "LPG FAULT"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "coFault",
+      "top": 235,
+      "left": 275,
+      "attrs": {
+        "color": "red",
+        "label": "CO FAULT"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "ack",
+      "top": 305,
+      "left": 275,
+      "attrs": {
+        "color": "green",
+        "label": "ACK / MUTE"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "inspect",
+      "top": 345,
+      "left": 275,
+      "attrs": {
+        "color": "blue",
+        "label": "INSPECTED"
+      }
+    },
+    {
+      "type": "wokwi-text",
+      "id": "valveLabel",
+      "top": 130,
+      "left": 525,
+      "attrs": {
+        "text": "Valve context"
+      }
+    },
+    {
+      "type": "wokwi-slide-switch",
+      "id": "valve",
+      "top": 155,
+      "left": 525,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-text",
+      "id": "stoveLabel",
+      "top": 215,
+      "left": 525,
+      "attrs": {
+        "text": "Stove context"
+      }
+    },
+    {
+      "type": "wokwi-slide-switch",
+      "id": "stove",
+      "top": 240,
+      "left": 525,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-text",
+      "id": "lpgTruthLabel",
+      "top": 300,
+      "left": 525,
+      "attrs": {
+        "text": "LPG leak TRUE (test label)"
+      }
+    },
+    {
+      "type": "wokwi-slide-switch",
+      "id": "lpgTruth",
+      "top": 325,
+      "left": 525,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-text",
+      "id": "coTruthLabel",
+      "top": 385,
+      "left": 525,
+      "attrs": {
+        "text": "CO hazard TRUE (test label)"
+      }
+    },
+    {
+      "type": "wokwi-slide-switch",
+      "id": "coTruth",
+      "top": 410,
+      "left": 525,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [
+      "esp:TX",
+      "$serialMonitor:RX",
+      "",
+      []
+    ],
+    [
+      "esp:RX",
+      "$serialMonitor:TX",
+      "",
+      []
+    ],
+    [
+      "lpg:SIG",
+      "esp:1",
+      "green",
+      []
+    ],
+    [
+      "lpg:VCC",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "lpg:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "co:SIG",
+      "esp:2",
+      "green",
+      []
+    ],
+    [
+      "co:VCC",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "co:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "temp:SIG",
+      "esp:8",
+      "green",
+      []
+    ],
+    [
+      "temp:VCC",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "temp:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "humid:SIG",
+      "esp:9",
+      "green",
+      []
+    ],
+    [
+      "humid:VCC",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "humid:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "interference:SIG",
+      "esp:10",
+      "green",
+      []
+    ],
+    [
+      "interference:VCC",
+      "esp:3V3.1",
+      "red",
+      []
+    ],
+    [
+      "interference:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "esp:5",
+      "green:A",
+      "green",
+      []
+    ],
+    [
+      "green:C",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "esp:6",
+      "amber:A",
+      "green",
+      []
+    ],
+    [
+      "amber:C",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "esp:7",
+      "red:A",
+      "green",
+      []
+    ],
+    [
+      "red:C",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "esp:4",
+      "buzzer:2",
+      "green",
+      []
+    ],
+    [
+      "buzzer:1",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "lpgFault:1.l",
+      "esp:13",
+      "red",
+      []
+    ],
+    [
+      "lpgFault:2.l",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "coFault:1.l",
+      "esp:21",
+      "red",
+      []
+    ],
+    [
+      "coFault:2.l",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "ack:1.l",
+      "esp:14",
+      "green",
+      []
+    ],
+    [
+      "ack:2.l",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "inspect:1.l",
+      "esp:12",
+      "blue",
+      []
+    ],
+    [
+      "inspect:2.l",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "valve:2",
+      "esp:15",
+      "green",
+      []
+    ],
+    [
+      "valve:1",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "valve:3",
+      "esp:3V3.2",
+      "red",
+      []
+    ],
+    [
+      "stove:2",
+      "esp:16",
+      "green",
+      []
+    ],
+    [
+      "stove:1",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "stove:3",
+      "esp:3V3.2",
+      "red",
+      []
+    ],
+    [
+      "lpgTruth:2",
+      "esp:11",
+      "green",
+      []
+    ],
+    [
+      "lpgTruth:1",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "lpgTruth:3",
+      "esp:3V3.2",
+      "red",
+      []
+    ],
+    [
+      "coTruth:2",
+      "esp:17",
+      "green",
+      []
+    ],
+    [
+      "coTruth:1",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "coTruth:3",
+      "esp:3V3.2",
+      "red",
+      []
+    ]
+  ]
+}

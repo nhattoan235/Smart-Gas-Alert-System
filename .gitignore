@@ -1,0 +1,5 @@
+firmware/.pio/
+dashboard/*.sqlite3
+dashboard/*.sqlite3-wal
+dashboard/*.sqlite3-shm
+**/__pycache__/

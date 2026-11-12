@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "description": "Khoang cach tu vi tri lap dau LPG den nguon chay gan nhat, KHONG phai khoang cach tu lo ro den nguon chay. Chi dien sau khi khao sat.",
+  "nodes": {
+    "node1": {"lpg_distance_to_ignition_m": null},
+    "node2": {"lpg_distance_to_ignition_m": null},
+    "node3": {"lpg_distance_to_ignition_m": null}
+  },
+  "scenario_layout": {
+    "illustrative_only": true,
+    "ignition": {"name": "Bếp", "x_m": 3.4, "y_m": 0.8},
+    "leak_candidates": {
+      "valve": {"name": "Giả định rò tại van", "x_m": 0.2, "y_m": 0.1},
+      "pipe": {"name": "Giả định lỗ nhỏ trên ống", "x_m": 1.8, "y_m": 0.1},
+      "stove": {"name": "Giả định rò gần bếp", "x_m": 3.1, "y_m": 0.2}
+    }
+  }
+}
