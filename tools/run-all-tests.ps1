@@ -9,16 +9,22 @@ $runId = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
 $resultRoot = Join-Path $repo 'test-results'
 $runDir = Join-Path $resultRoot $runId
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+. (Join-Path $PSScriptRoot 'msvc_compile_arguments.ps1')
+. (Join-Path $PSScriptRoot 'wokwi_failure_classification.ps1')
+. (Join-Path $PSScriptRoot 'nvs_runtime_wokwi_config.ps1')
 
 $script:tests = [System.Collections.Generic.List[object]]::new()
 $script:timeline = [System.Collections.Generic.List[object]]::new()
 $script:runnerErrors = [System.Collections.Generic.List[object]]::new()
+$script:wokwiQuotaExhausted = $false
 $script:python = Get-Command python -ErrorAction SilentlyContinue
 $script:node = Get-Command node -ErrorAction SilentlyContinue
 $script:powerShellVersion = $PSVersionTable.PSVersion.ToString()
+$script:powerShellExecutable = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
 $script:pioCoreDir = Join-Path $runDir 'platformio-core'
 $script:pioPackagesDir = $null
 $script:pioModule = $false
+$script:mqttCaCertPath = $null
 $script:pythonVersion = 'unavailable'
 $script:pioVersion = 'unavailable'
 $script:wokwiVersion = 'unavailable'
@@ -64,17 +70,74 @@ if (-not $script:wokwiPath -and -not [string]::IsNullOrWhiteSpace($env:USERPROFI
   if (Test-Path -LiteralPath $wokwiCandidate -PathType Leaf) { $script:wokwiPath = $wokwiCandidate }
 }
 $script:wokwiTokenPresent = -not [string]::IsNullOrWhiteSpace($env:WOKWI_CLI_TOKEN)
+$script:vsCodePath = $null
+$script:wokwiVscodeExtensionPath = $null
+$wokwiExtensionRoot = Join-Path $env:USERPROFILE '.vscode\extensions'
+if (Test-Path -LiteralPath $wokwiExtensionRoot -PathType Container) {
+  $script:wokwiVscodeExtensionPath = Get-ChildItem -LiteralPath $wokwiExtensionRoot -Directory -Filter 'wokwi.wokwi-vscode-*' -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+}
+$vsCodeCommand = Get-Command code -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($vsCodeCommand -and $vsCodeCommand.CommandType -in @('Application','ExternalScript')) {
+  $script:vsCodePath = $vsCodeCommand.Source
+  if (-not $script:vsCodePath) { $script:vsCodePath = $vsCodeCommand.Path }
+}
+if (-not $script:vsCodePath) {
+  $vsCodeCommand = Get-Command code.cmd -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($vsCodeCommand) { $script:vsCodePath = $vsCodeCommand.Source }
+}
 if ($script:wokwiPath) {
   $wokwiVersionProbe = Invoke-ScrubbedVersionProbe $script:wokwiPath @('--version')
   $script:wokwiVersion = $wokwiVersionProbe.output
 }
 $script:mosquitto = Get-Command mosquitto -ErrorAction SilentlyContinue
+if (-not $script:mosquitto) { $script:mosquitto = Get-Command mosquitto.exe -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -eq 'Application' } | Select-Object -First 1 }
+if (-not $script:mosquitto -and -not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+  $candidate = Join-Path $env:ProgramFiles 'mosquitto\mosquitto.exe'
+  if (Test-Path -LiteralPath $candidate -PathType Leaf) { $script:mosquitto = [pscustomobject]@{ Source = $candidate } }
+}
+if (-not $script:mosquitto -and -not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+  $candidate = Join-Path ${env:ProgramFiles(x86)} 'mosquitto\mosquitto.exe'
+  if (Test-Path -LiteralPath $candidate -PathType Leaf) { $script:mosquitto = [pscustomobject]@{ Source = $candidate } }
+}
+if (-not $script:mosquitto -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+  $candidate = Join-Path $env:LOCALAPPDATA 'Programs\mosquitto\mosquitto.exe'
+  if (Test-Path -LiteralPath $candidate -PathType Leaf) { $script:mosquitto = [pscustomobject]@{ Source = $candidate } }
+}
+if (-not $script:mosquitto) {
+  $candidatePaths = @()
+  if (-not [string]::IsNullOrWhiteSpace($env:MOSQUITTO_HOME)) { $candidatePaths += Join-Path $env:MOSQUITTO_HOME 'mosquitto.exe' }
+  $candidatePaths += 'G:\Mosquitto\mosquitto.exe'
+  foreach ($candidate in $candidatePaths) {
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+      $script:mosquitto = [pscustomobject]@{ Source = $candidate }
+      break
+    }
+  }
+}
 if ($script:mosquitto) {
   $mosquittoVersionProbe = Invoke-ScrubbedVersionProbe $script:mosquitto.Source @('-h')
   $script:mosquittoVersion = ($mosquittoVersionProbe.output -split "`r?`n" | Select-Object -First 1).Trim()
 }
+$script:mosquittoPasswd = Get-Command mosquitto_passwd -ErrorAction SilentlyContinue
+if (-not $script:mosquittoPasswd) { $script:mosquittoPasswd = Get-Command mosquitto_passwd.exe -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -eq 'Application' } | Select-Object -First 1 }
+if (-not $script:mosquittoPasswd -and $script:mosquitto -and $script:mosquitto.Source) {
+  $candidate = Join-Path (Split-Path -Parent $script:mosquitto.Source) 'mosquitto_passwd.exe'
+  if (Test-Path -LiteralPath $candidate -PathType Leaf) { $script:mosquittoPasswd = [pscustomobject]@{ Source = $candidate } }
+}
 $script:mosquittoPub = Get-Command mosquitto_pub -ErrorAction SilentlyContinue
 $script:mosquittoSub = Get-Command mosquitto_sub -ErrorAction SilentlyContinue
+if ($script:mosquitto -and $script:mosquitto.Source) {
+  $mosquittoDirectory = Split-Path -Parent $script:mosquitto.Source
+  if (-not $script:mosquittoPub) {
+    $candidate = Join-Path $mosquittoDirectory 'mosquitto_pub.exe'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { $script:mosquittoPub = [pscustomobject]@{ Source = $candidate } }
+  }
+  if (-not $script:mosquittoSub) {
+    $candidate = Join-Path $mosquittoDirectory 'mosquitto_sub.exe'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { $script:mosquittoSub = [pscustomobject]@{ Source = $candidate } }
+  }
+}
 $script:cpp = Get-Command g++ -ErrorAction SilentlyContinue
 $script:cppKind = ''
 if ($script:cpp) { $script:cppKind = 'gnu' }
@@ -236,7 +299,7 @@ function Write-RunnerDiagnostic([string]$Name, [string]$Command, [string]$Catego
   $script:runnerErrors.Add($entry)
 }
 
-function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory, [string]$LogName, [int]$TimeoutSeconds, [string]$Detail = '') {
+function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arguments, [string]$WorkingDirectory, [string]$LogName, [int]$TimeoutSeconds, [string]$Detail = '', [hashtable]$EnvironmentOverrides = @{}) {
   $start = Get-Date
   $logPath = Join-Path $runDir $LogName
   $safeCommand = Format-ProcessCommand $Executable $Arguments
@@ -264,16 +327,31 @@ function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arg
     # to the isolated PlatformIO child process after the full-mode preflight.
     $psi.EnvironmentVariables['WOKWI_CLI_TOKEN'] = ''
     $psi.EnvironmentVariables['GAS_MQTT_PASSWORD'] = ''
+    $psi.EnvironmentVariables['GAS_MQTT_CA_CERT_FILE'] = ''
     $psi.EnvironmentVariables['MQTT_PASSWORD'] = ''
     $psi.EnvironmentVariables['WIFI_PASSWORD'] = ''
     $psi.EnvironmentVariables['GAS_SYNC_TOKEN'] = ''
     $psi.EnvironmentVariables['GAS_SYNC_API_TOKEN'] = ''
     $psi.EnvironmentVariables['MQTT_USER'] = ''
     $psi.EnvironmentVariables['GAS_E2E_TMPDIR'] = ''
-    if ($Name -eq 'firmware-build-node1-node2-node3') {
+    if ($Name -in @('firmware-build-node1-node2-node3','firmware-build-nvs-runtime','firmware-build-mqtt-tls-compile','firmware-build-mqtt-tls-runtime')) {
       $buildPassword = [string]$env:GAS_MQTT_PASSWORD
-      if ([string]::IsNullOrWhiteSpace($buildPassword)) { throw 'GAS_MQTT_PASSWORD became empty before PlatformIO launch; refusing to start the build.' }
-      $psi.EnvironmentVariables['GAS_MQTT_PASSWORD'] = $buildPassword
+      if ($Name -eq 'firmware-build-node1-node2-node3') {
+        if ([string]::IsNullOrWhiteSpace($buildPassword)) { throw 'GAS_MQTT_PASSWORD became empty before production node build; refusing to start the build.' }
+        $psi.EnvironmentVariables['GAS_MQTT_PASSWORD'] = $buildPassword
+      } else {
+        $psi.EnvironmentVariables['GAS_MQTT_PASSWORD'] = ''
+      }
+      if ($Name -eq 'firmware-build-mqtt-tls-runtime') {
+        if ([string]::IsNullOrWhiteSpace($script:tlsRuntimePassword)) { throw 'TLS runtime build requires a random per-run password.' }
+        $psi.EnvironmentVariables['GAS_MQTT_PASSWORD'] = $script:tlsRuntimePassword
+      }
+      if ($Name -in @('firmware-build-mqtt-tls-compile','firmware-build-mqtt-tls-runtime')) {
+        if ([string]::IsNullOrWhiteSpace($script:mqttCaCertPath) -or -not (Test-Path -LiteralPath $script:mqttCaCertPath -PathType Leaf)) {
+          throw 'MQTT TLS target requires the ephemeral CA PEM generated for this run.'
+        }
+        $psi.EnvironmentVariables['GAS_MQTT_CA_CERT_FILE'] = $script:mqttCaCertPath
+      }
       $pioCache = Join-Path $script:pioCoreDir 'cache'
       $pioGlobalLibs = Join-Path $script:pioCoreDir 'globallib'
       $localPlatforms = Join-Path $script:pioCoreDir 'platforms'
@@ -290,6 +368,8 @@ function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arg
         if (-not (Test-Path -LiteralPath $localPlatform -PathType Container)) {
           Copy-Item -LiteralPath (Join-Path $existingPlatforms 'espressif32') -Destination $localPlatform -Recurse
         }
+      } else {
+        throw 'The existing PlatformIO espressif32 platform package is unavailable; refusing an implicit download during this test run.'
       }
       # Keep mutable PlatformIO core/platform state in the run directory. Reuse
       # the exact installed global packages folder directly; never create a
@@ -301,11 +381,14 @@ function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arg
       $psi.EnvironmentVariables['PLATFORMIO_PACKAGES_DIR'] = $existingPackages
       $script:pioPackagesDir = $existingPackages
     }
-    if ($Name -eq 'mqtt-sqlite-app-ack-dedup-harness') {
+  if ($Name -in @('mqtt-sqlite-app-ack-dedup-harness','mqtt-security-policy-harness')) {
       $psi.EnvironmentVariables['GAS_E2E_TMPDIR'] = $runDir
     }
     if ($Name -like 'wokwi-node*' -and $script:wokwiTokenPresent) {
       $psi.EnvironmentVariables['WOKWI_CLI_TOKEN'] = [string]$env:WOKWI_CLI_TOKEN
+    }
+    foreach ($environmentName in $EnvironmentOverrides.Keys) {
+      $psi.EnvironmentVariables[[string]$environmentName] = [string]$EnvironmentOverrides[$environmentName]
     }
     $quotedArguments = @($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) })
     $psi.Arguments = $quotedArguments -join ' '
@@ -337,7 +420,7 @@ function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arg
     if ($stdoutReady) { $stdout = $stdoutTask.GetAwaiter().GetResult() } else { $stdout = '[stdout drain timed out after process exit]' }
     if ($stderrReady) { $stderr = $stderrTask.GetAwaiter().GetResult() } else { $stderr = '[stderr drain timed out after process exit]' }
     $processEnvSummary = ''
-    if ($Name -eq 'firmware-build-node1-node2-node3') {
+    if ($Name -in @('firmware-build-node1-node2-node3','firmware-build-nvs-runtime')) {
       $processEnvSummary = "PLATFORMIO_CORE_DIR=$($psi.EnvironmentVariables['PLATFORMIO_CORE_DIR']); PLATFORMIO_PLATFORMS_DIR=$($psi.EnvironmentVariables['PLATFORMIO_PLATFORMS_DIR']); PLATFORMIO_PACKAGES_DIR=$($psi.EnvironmentVariables['PLATFORMIO_PACKAGES_DIR'])"
     }
     $processOutput = Protect-DiagnosticText ("$stdout`r`n$stderr")
@@ -345,7 +428,13 @@ function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arg
     $environmentBlockReason = $null
     $permissionPath = $null
     if ($processOutput -match "(?im)Permission denied:\s*'([^']+)'" ) { $permissionPath = $Matches[1] }
-    if ($code -ne 0 -and $Name -eq 'firmware-build-node1-node2-node3' -and $permissionPath -match '(?i)(?:platforms|packages)\.lock$') {
+    $wokwiTransportBlockReason = Get-WokwiTransportBlockReason -TestName $Name -ExitCode $code -ProcessOutput $processOutput
+    if ($wokwiTransportBlockReason) {
+      $environmentBlockReason = $wokwiTransportBlockReason
+      if ($Name -like 'wokwi-*' -and $wokwiTransportBlockReason -match '(?i)monthly CI minute quota') {
+        $script:wokwiQuotaExhausted = $true
+      }
+    } elseif ($code -ne 0 -and $Name -in @('firmware-build-node1-node2-node3','firmware-build-nvs-runtime') -and $permissionPath -match '(?i)(?:platforms|packages)\.lock$') {
       $environmentBlockReason = "PlatformIO could not access its package-manager lock '$permissionPath'; build was not evaluated as a source assertion."
     } elseif ($code -ne 0 -and $processOutput -match '(?i)ModuleNotFoundError: No module named|Cannot find module ["'']|UnknownPackageError|Could not find the package') {
       $environmentBlockReason = 'Required runtime or toolchain package is unavailable in this environment.'
@@ -362,7 +451,10 @@ function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arg
       $status = 'BLOCKED'
       $code = 77
       $extra = 'The installed Xtensa compiler executable launched but did not complete its version probe; firmware compilation was not evaluated.'
-    } elseif ($code -ne 0 -and $Name -eq 'firmware-build-node1-node2-node3' -and $processOutput -match '(?im)^xtensa-esp32s3-elf-g\+\+: error: CreateProcess: No such file or directory\s*$') {
+    } elseif ($code -eq 77 -and $Name -in @('firmware-nvs-offline-replay-runtime','firmware-mqtt-tls-runtime','mqtt-security-mosquitto-runtime')) {
+      $status = 'BLOCKED'
+      $extra = 'Runtime test driver reported a missing local runtime prerequisite; see its evidence log.'
+    } elseif ($code -ne 0 -and $Name -in @('firmware-build-node1-node2-node3','firmware-build-nvs-runtime') -and $processOutput -match '(?im)^xtensa-esp32s3-elf-g\+\+: error: CreateProcess: No such file or directory\s*$') {
       $status = 'BLOCKED'
       $code = 77
       $extra = 'PlatformIO started, but its Xtensa compiler could not launch an internal child process. This is a toolchain/runtime blocker; no source-level compiler diagnostic was produced.'
@@ -392,6 +484,59 @@ function Invoke-LoggedProcess([string]$Name, [string]$Executable, [string[]]$Arg
   }
 }
 
+function Invoke-WokwiNodeScenarioWithRetry([string]$Name, [string]$Executable, [string[]]$Arguments,
+                                           [string]$WorkingDirectory, [string]$LogName,
+                                           [int]$TimeoutSeconds, [string]$Detail) {
+  if ($script:wokwiQuotaExhausted) {
+    Add-Blocked $Name $LogName 'Wokwi monthly CI quota was exhausted by an earlier scenario; this cloud call was skipped.'
+    return
+  }
+  Invoke-LoggedProcess $Name $Executable $Arguments $WorkingDirectory $LogName $TimeoutSeconds $Detail
+  $firstResult = $script:tests | Where-Object { $_.name -eq $Name } | Select-Object -Last 1
+  $firstLogPath = Join-Path $runDir $LogName
+  if (-not $firstResult -or -not (Test-Path -LiteralPath $firstLogPath -PathType Leaf)) { return }
+  $firstOutput = Get-Content -LiteralPath $firstLogPath -Raw
+  if (-not (Test-WokwiTransportRetryEligible -TestName $Name -Attempt 1 -Status $firstResult.status `
+      -ExitCode $firstResult.exit_code -ProcessOutput $firstOutput)) { return }
+
+  $attemptLogName = [System.IO.Path]::GetFileNameWithoutExtension($LogName) + '-attempt1.log'
+  Copy-Item -LiteralPath $firstLogPath -Destination (Join-Path $runDir $attemptLogName) -Force
+  foreach ($artifactFlag in @('--serial-log-file','--vcd-file')) {
+    $argumentIndex = -1
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+      if ($Arguments[$index] -ceq $artifactFlag) { $argumentIndex = $index; break }
+    }
+    if ($argumentIndex -ge 0 -and ($argumentIndex + 1) -lt $Arguments.Count) {
+      $artifactPath = [string]$Arguments[$argumentIndex + 1]
+      if (Test-Path -LiteralPath $artifactPath -PathType Leaf) {
+        $artifactDirectory = Split-Path -Parent $artifactPath
+        $artifactBase = [System.IO.Path]::GetFileNameWithoutExtension($artifactPath)
+        $artifactExtension = [System.IO.Path]::GetExtension($artifactPath)
+        $attemptArtifact = Join-Path $artifactDirectory ($artifactBase + '-attempt1' + $artifactExtension)
+        Move-Item -LiteralPath $artifactPath -Destination $attemptArtifact -Force
+      }
+    }
+  }
+  for ($index = $script:tests.Count - 1; $index -ge 0; $index--) {
+    if ($script:tests[$index].name -eq $Name) { $script:tests.RemoveAt($index); break }
+  }
+  for ($index = $script:timeline.Count - 1; $index -ge 0; $index--) {
+    if ($script:timeline[$index].test -eq $Name) { $script:timeline.RemoveAt($index); break }
+  }
+
+  $retryDetail = "$Detail One bounded retry was started after the Wokwi API transport closed with code 1006; first attempt evidence is $attemptLogName."
+  Invoke-LoggedProcess $Name $Executable $Arguments $WorkingDirectory $LogName $TimeoutSeconds $retryDetail
+  $finalResult = $script:tests | Where-Object { $_.name -eq $Name } | Select-Object -Last 1
+  if ($finalResult) {
+    if ($finalResult.status -eq 'PASS') {
+      $finalResult.detail = "$retryDetail Retry scenario completed successfully."
+    } else {
+      $finalResult.detail = "$($finalResult.detail) The single retry did not pass; first attempt evidence is $attemptLogName."
+      Add-Content -LiteralPath (Join-Path $runDir $LogName) -Value "`r`nRETRY_NOTE: one bounded retry was attempted after API transport code 1006; first attempt evidence: $attemptLogName." -Encoding utf8
+    }
+  }
+}
+
 function Add-Blocked([string]$Name, [string]$LogName, [string]$Reason) {
   $start = Get-Date
   Set-Content -Path (Join-Path $runDir $LogName) -Value "BLOCKED: $Reason`r`nPROCESS_STARTED: False`r`nEXIT_CODE: 127" -Encoding utf8
@@ -402,6 +547,23 @@ function Add-NotTested([string]$Name, [string]$LogName, [string]$Reason) {
   $start = Get-Date
   Set-Content -Path (Join-Path $runDir $LogName) -Value "NOT TESTED: $Reason" -Encoding utf8
   Add-Result $Name 'NOT TESTED' 0 $LogName $Reason $start (Get-Date)
+}
+
+function Set-ExistingResultStatus([string]$Name, [string]$Status, [int]$ExitCode, [string]$Detail) {
+  for ($index = $script:tests.Count - 1; $index -ge 0; $index--) {
+    if ($script:tests[$index].name -eq $Name) {
+      $script:tests[$index].status = $Status
+      $script:tests[$index].exit_code = $ExitCode
+      $script:tests[$index].detail = $Detail
+      break
+    }
+  }
+  for ($index = $script:timeline.Count - 1; $index -ge 0; $index--) {
+    if ($script:timeline[$index].test -eq $Name) {
+      $script:timeline[$index].status = $Status
+      break
+    }
+  }
 }
 
 function Remove-IsolatedFirmwareBuildArtifacts {
@@ -481,24 +643,59 @@ function Test-IsolatedLogicAnalyzer([string]$FirmwareRoot) {
 }
 
 function Invoke-QuickTests([switch]$ForFull) {
+  $nvsBrokerIsolationRegression = Join-Path $PSScriptRoot 'test_nvs_runtime_broker_isolation.ps1'
+  if ((Test-Path -LiteralPath $script:powerShellExecutable -PathType Leaf) -and (Test-Path -LiteralPath $nvsBrokerIsolationRegression -PathType Leaf)) {
+    Invoke-LoggedProcess 'nvs-runtime-broker-isolation-regression' $script:powerShellExecutable @('-NoProfile','-File',$nvsBrokerIsolationRegression) $repo 'nvs-runtime-broker-isolation-regression.log' 30 'Regression assertion: NVS firmware keeps host.wokwi.internal:1884 while cloud simulation nodes are redirected away from the demo broker.'
+  } else {
+    Add-Blocked 'nvs-runtime-broker-isolation-regression' 'nvs-runtime-broker-isolation-regression.log' 'PowerShell executable or NVS runtime broker isolation regression script is unavailable.'
+  }
+  $nvsWokwiConfigRegression = Join-Path $PSScriptRoot 'test_nvs_runtime_wokwi_config.ps1'
+  if ((Test-Path -LiteralPath $script:powerShellExecutable -PathType Leaf) -and (Test-Path -LiteralPath $nvsWokwiConfigRegression -PathType Leaf)) {
+    Invoke-LoggedProcess 'nvs-runtime-wokwi-config-regression' $script:powerShellExecutable @('-NoProfile','-File',$nvsWokwiConfigRegression) $repo 'nvs-runtime-wokwi-config-regression.log' 30 'Regression assertion: RFC2217 setting is a separate TOML line and paths point at the fresh test build.'
+  } else {
+    Add-Blocked 'nvs-runtime-wokwi-config-regression' 'nvs-runtime-wokwi-config-regression.log' 'PowerShell executable or NVS runtime Wokwi config regression script is unavailable.'
+  }
+  $argumentRegression = Join-Path $PSScriptRoot 'test_msvc_compile_arguments.ps1'
+  if ((Test-Path -LiteralPath $script:powerShellExecutable -PathType Leaf) -and (Test-Path -LiteralPath $argumentRegression -PathType Leaf)) {
+    Invoke-LoggedProcess 'msvc-compile-argument-regression' $script:powerShellExecutable @('-NoProfile','-File',$argumentRegression) $repo 'msvc-compile-argument-regression.log' 30 'Regression assertion: MSVC /Fo and /Fe are separate arguments, including paths with spaces.'
+  } else {
+    Add-Blocked 'msvc-compile-argument-regression' 'msvc-compile-argument-regression.log' 'PowerShell executable or MSVC argument regression test script is unavailable.'
+  }
+  $wokwiFailureRegression = Join-Path $PSScriptRoot 'test_wokwi_failure_classification.ps1'
+  if ((Test-Path -LiteralPath $script:powerShellExecutable -PathType Leaf) -and (Test-Path -LiteralPath $wokwiFailureRegression -PathType Leaf)) {
+    Invoke-LoggedProcess 'wokwi-transport-classification-regression' $script:powerShellExecutable @('-NoProfile','-File',$wokwiFailureRegression) $repo 'wokwi-transport-classification-regression.log' 30 'Regression assertion: API transport closure is BLOCKED; scenario assertion failures remain FAIL.'
+  } else {
+    Add-Blocked 'wokwi-transport-classification-regression' 'wokwi-transport-classification-regression.log' 'PowerShell executable or Wokwi transport classification regression script is unavailable.'
+  }
   if ($script:python) {
-    Invoke-LoggedProcess 'backend-regression' $script:python.Source @('-m','unittest','discover','-s','dashboard','-p','test_server.py','-v') $repo 'backend-tests.log' 120 'Python unittest; dashboard/backend assertions.'
+    Invoke-LoggedProcess 'backend-regression' $script:python.Source @('-m','unittest','discover','-s','dashboard','-p','test_*.py','-v') $repo 'backend-tests.log' 120 'Python unittest across dashboard/backend test files, including MQTT gateway TLS fail-closed checks.'
     if ($script:node) {
       Invoke-LoggedProcess 'frontend-regression' $script:node.Source @('test_frontend.js') (Join-Path $repo 'dashboard') 'frontend-tests.log' 60 'Node assertions for dashboard rendering and assets.'
     } else { Add-Blocked 'frontend-regression' 'frontend-tests.log' 'Node.js is not available in PATH.' }
     Invoke-LoggedProcess 'trace-evaluation-regression' $script:python.Source @('-m','unittest','discover','-s','tools/evaluation','-p','test_*.py','-v') $repo 'evaluation-tests.log' 120 'Python unittest over labeled trace evaluation.'
     Invoke-LoggedProcess 'wokwi-config-static' $script:python.Source @('tools/validate_wokwi_scenarios.py') $repo 'wokwi-static-validation.log' 30 'Static scenario/diagram assertions only; not a simulator run.'
     Invoke-LoggedProcess 'wokwi-artifact-validation-regression' $script:python.Source @('-m','unittest','tools.test_wokwi_validation','-v') $repo 'wokwi-artifact-validation-tests.log' 60 'Regression tests for static validation with/without binaries and separate post-build artifact validation.'
+    Invoke-LoggedProcess 'firmware-nvs-runtime-driver-unit' $script:python.Source @('-m','unittest','discover','-s','tools/e2e','-p','test_firmware_nvs_replay_driver.py','-v') $repo 'nvs-runtime-driver-unit.log' 30 'Unit tests for runtime driver serial parsing and identity assertions; not firmware runtime evidence.'
+    Invoke-LoggedProcess 'firmware-nvs-runtime-vcd-unit' $script:python.Source @('-m','unittest','discover','-s','tools/e2e','-p','test_verify_nvs_runtime_vcd.py','-v') $repo 'nvs-runtime-vcd-unit.log' 30 'Unit tests prove red GPIO and buzzer VCD assertions reject missing or inactive output traces; not Wokwi runtime evidence.'
     $mqttHarness = Join-Path $repo 'tools/e2e/mqtt_ack_harness.py'
     if (Test-Path $mqttHarness) {
       Invoke-LoggedProcess 'mqtt-sqlite-app-ack-dedup-harness' $script:python.Source @($mqttHarness) $repo 'mqtt-integration.log' 60 'Protocol/backend integration harness with isolated loopback broker and temporary SQLite; does not use firmware/NVS.'
     } else { Add-Blocked 'mqtt-sqlite-app-ack-dedup-harness' 'mqtt-integration.log' 'Isolated MQTT/backend harness is not available in this checkout.' }
+    $mqttSecurityTests = Join-Path $repo 'tools/e2e/test_mqtt_security_static.py'
+    if (Test-Path -LiteralPath $mqttSecurityTests -PathType Leaf) {
+      Invoke-LoggedProcess 'mqtt-security-source-regression' $script:python.Source @('-m','unittest','tools.e2e.test_mqtt_security_static','-v') $repo 'mqtt-security-source-regression.log' 60 'Source/config assertions for fail-closed TLS, ACL policy, and exact NVS-head ACK handling.'
+    } else { Add-Blocked 'mqtt-security-source-regression' 'mqtt-security-source-regression.log' 'MQTT security source regression suite is unavailable.' }
+    $mqttSecurityHarness = Join-Path $repo 'tools/e2e/mqtt_security_harness.py'
+    if (Test-Path -LiteralPath $mqttSecurityHarness -PathType Leaf) {
+      Invoke-LoggedProcess 'mqtt-security-policy-harness' $script:python.Source @($mqttSecurityHarness) $repo 'mqtt-security-policy-harness.log' 60 'Loopback-only custom Python policy broker; exercises auth, TLS CA/hostname checks, ACL read/write, and forged ACK denial. Not Mosquitto or firmware runtime.'
+    } else { Add-Blocked 'mqtt-security-policy-harness' 'mqtt-security-policy-harness.log' 'Isolated MQTT security harness is unavailable.' }
   } else {
     Add-Blocked 'backend-regression' 'backend-tests.log' 'Python is not available in PATH.'
     Add-Blocked 'frontend-regression' 'frontend-tests.log' 'Python launcher unavailable; frontend test was not scheduled.'
     Add-Blocked 'trace-evaluation-regression' 'evaluation-tests.log' 'Python is not available in PATH.'
     Add-Blocked 'wokwi-config-static' 'wokwi-static-validation.log' 'Python is not available in PATH.'
     Add-Blocked 'wokwi-artifact-validation-regression' 'wokwi-artifact-validation-tests.log' 'Python is not available in PATH.'
+    Add-Blocked 'firmware-nvs-runtime-driver-unit' 'nvs-runtime-driver-unit.log' 'Python is not available in PATH.'
     Add-Blocked 'mqtt-sqlite-app-ack-dedup-harness' 'mqtt-integration.log' 'Python is not available in PATH.'
   }
 
@@ -509,8 +706,8 @@ function Invoke-QuickTests([switch]$ForFull) {
       @{ name='nvs-queue-policy'; file='event_queue_policy_test.cpp'; sources=@() },
       @{ name='nvs-failure-injection'; file='event_queue_nvs_failure_test.cpp'; sources=@() },
       @{ name='ack-remove-source-regression'; file='event_ack_remove_source_test.cpp'; sources=@() },
-      @{ name='sensor-drivers-unit'; file='sensor_drivers_test.cpp'; sources=@('src/SensorDrivers.cpp','src/WireI2cBus.cpp') },
-      @{ name='sensor-health-unit'; file='sensor_health_test.cpp'; sources=@() },
+      @{ name='sensor-drivers-unit'; file='sensor_drivers_test.cpp'; sources=@('src/SensorDrivers.cpp') },
+      @{ name='sensor-health-unit'; file='sensor_health_test.cpp'; sources=@('src/Detector.cpp') },
       @{ name='mq7b-heater-sequencer-unit'; file='mq7b_heater_sequencer_test.cpp'; sources=@() }
     )
     foreach ($h in $harnesses) {
@@ -520,9 +717,13 @@ function Invoke-QuickTests([switch]$ForFull) {
       if ($script:cppKind -eq 'msvc') {
         $objectDir = Join-Path $runDir ($h.name + '-objects')
         New-Item -ItemType Directory -Path $objectDir -Force | Out-Null
-        $compileArgs = @('/nologo','/std:c++14','/W4',('/I' + (Join-Path $fw 'include')),$source)
-        foreach ($s in $h.sources) { $compileArgs += (Join-Path $fw $s) }
-        $compileArgs += @('/Fo' + ($objectDir.TrimEnd('\') + '\'),('/Fe' + $binary))
+        $compileSources = @($source)
+        foreach ($s in $h.sources) { $compileSources += (Join-Path $fw $s) }
+        $compileArgs = New-MsvcHarnessCompileArguments `
+          -IncludeDirectory (Join-Path $fw 'include') `
+          -SourceFiles $compileSources `
+          -ObjectDirectory $objectDir `
+          -ExecutablePath $binary
       } else {
         $compileArgs = @('-std=c++11','-Wall','-Wextra','-I', (Join-Path $fw 'include'), $source)
         foreach ($s in $h.sources) { $compileArgs += (Join-Path $fw $s) }
@@ -534,6 +735,23 @@ function Invoke-QuickTests([switch]$ForFull) {
       if (-not $compileResult -or $compileResult.status -ne 'PASS') { continue }
       $harnessCwd = if ($h.name -eq 'ack-remove-source-regression') { $fw } else { $repo }
       Invoke-LoggedProcess $h.name $binary @() $harnessCwd ($h.name + '.log') 30 'Host C++ harness assertion result.'
+      if ($h.name -eq 'detector-state-machine') {
+        $detectorResult = $script:tests | Where-Object { $_.name -eq 'detector-state-machine' } | Select-Object -Last 1
+        $metricLogName = 'cross-interference-metrics.log'
+        if ($detectorResult -and $detectorResult.status -eq 'PASS') {
+          $detectorLogPath = Join-Path $runDir 'detector-state-machine.log'
+          $metricLines = @(Get-Content -LiteralPath $detectorLogPath | Where-Object { $_ -match '^negative_interference_metrics gas=' })
+          if ($metricLines.Count -eq 3 -and ($metricLines -match 'gas=LPG') -and ($metricLines -match 'gas=CO') -and ($metricLines -match 'gas=ALL')) {
+            Set-Content -LiteralPath (Join-Path $runDir $metricLogName) -Value ($metricLines -join "`r`n") -Encoding utf8
+            Add-Result 'cross-interference-metrics' 'PASS' 0 $metricLogName 'Three measured synthetic metric rows (LPG, CO, aggregate) were emitted by the passing Detector harness.' (Get-Date) (Get-Date) '' $false
+          } else {
+            Set-Content -LiteralPath (Join-Path $runDir $metricLogName) -Value "FAIL: expected LPG, CO, and aggregate metric rows from detector-state-machine.log; found $($metricLines.Count)." -Encoding utf8
+            Add-Result 'cross-interference-metrics' 'FAIL' 1 $metricLogName 'Detector harness passed but did not emit the required per-gas FNR/latency metrics.' (Get-Date) (Get-Date) '' $false
+          }
+        } else {
+          Add-Blocked 'cross-interference-metrics' $metricLogName 'Detector host harness did not PASS, so synthetic FNR/latency metrics were not accepted.'
+        }
+      }
     }
   } else {
     foreach ($name in @('detector-state-machine','nvs-queue-policy','nvs-failure-injection','ack-remove-source-regression','sensor-drivers-unit','sensor-health-unit','mq7b-heater-sequencer-unit')) {
@@ -542,6 +760,137 @@ function Invoke-QuickTests([switch]$ForFull) {
   }
   if (-not $ForFull) {
     Add-NotTested 'firmware-nvs-offline-replay-runtime' 'nvs-replay.log' 'Quick mode deliberately excludes firmware runtime, reboot persistence, and broker outage scenarios.'
+    Add-NotTested 'nvs-runtime-gpio-vcd' 'nvs-runtime-gpio-vcd.log' 'Quick mode does not start Wokwi or capture simulated GPIO traces.'
+    Add-NotTested 'wokwi-node3-sensor-faults' 'wokwi-node3-sensor-faults.log' 'Quick mode does not start the Wokwi sensor-fault scenario.'
+    Add-NotTested 'wokwi-node3-sensor-faults-gpio-vcd' 'wokwi-node3-sensor-faults-gpio-vcd.log' 'Quick mode does not start Wokwi or capture sensor-fault GPIO traces.'
+    Add-NotTested 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'Quick mode does not run a firmware TLS simulator session.'
+    Add-NotTested 'mqtt-security-test-ca-fixture' 'mqtt-security-test-ca.log' 'Quick mode does not create a compile-only TLS certificate fixture.'
+    Add-NotTested 'firmware-build-mqtt-tls-compile' 'firmware-mqtt-tls-build.log' 'Quick mode does not invoke PlatformIO secure transport compilation.'
+    Add-NotTested 'mqtt-security-mosquitto-runtime' 'mqtt-security-mosquitto-runtime.log' 'Quick mode does not run a Mosquitto broker compatibility test.'
+  }
+}
+
+function Get-IsolatedWokwiWindow([string]$Marker) {
+  return @(Get-Process Code -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like "*$Marker*" })
+}
+
+function Send-IsolatedWokwiCommand([string]$Marker, [string]$CommandTitle) {
+  $windows = @(Get-IsolatedWokwiWindow $Marker)
+  if ($windows.Count -ne 1) {
+    throw "Expected exactly one test-owned VS Code window containing '$Marker'; found $($windows.Count)."
+  }
+  $window = $windows[0]
+  $shell = New-Object -ComObject WScript.Shell
+  if (-not $shell.AppActivate([int]$window.Id)) {
+    throw "Could not activate the test-owned VS Code window for '$Marker'."
+  }
+  Start-Sleep -Milliseconds 500
+  $shell.SendKeys('^+p')
+  Start-Sleep -Milliseconds 350
+  $shell.SendKeys($CommandTitle)
+  Start-Sleep -Milliseconds 500
+  $shell.SendKeys('{ENTER}')
+}
+
+function Focus-IsolatedWokwiWindow([string]$Marker) {
+  $windows = @(Get-IsolatedWokwiWindow $Marker)
+  if ($windows.Count -ne 1) {
+    throw "Expected exactly one test-owned VS Code window containing '$Marker' while focusing the simulator; found $($windows.Count)."
+  }
+  $shell = New-Object -ComObject WScript.Shell
+  if (-not $shell.AppActivate([int]$windows[0].Id)) {
+    throw "Could not keep the test-owned Wokwi window '$Marker' in the foreground."
+  }
+  Start-Sleep -Milliseconds 300
+}
+
+function Wait-IsolatedWokwiRfc2217Listener([int]$Port, [string]$Marker, [int]$TimeoutSeconds = 25) {
+  $testWindows = @(Get-IsolatedWokwiWindow $Marker)
+  if ($testWindows.Count -ne 1) {
+    throw "Expected exactly one test-owned VS Code window '$Marker' while verifying RFC2217 listener ownership; found $($testWindows.Count)."
+  }
+  $testRootIds = @($testWindows | ForEach-Object { [int]$_.Id })
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    try {
+      $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop)
+    } catch {
+      throw "Could not inspect local TCP listener state for port $Port ($($_.Exception.GetType().Name)): $($_.Exception.Message)"
+    }
+    if ($listeners.Count -gt 0) {
+      $details = [System.Collections.Generic.List[string]]::new()
+      foreach ($listener in $listeners) {
+        $ownerPid = [int]$listener.OwningProcess
+        $processName = 'unknown'
+        try {
+          $owner = Get-Process -Id $ownerPid -ErrorAction Stop
+          $processName = $owner.ProcessName
+        } catch {}
+        try {
+          $belongsToTestWindow = Test-IsolatedWokwiProcessTree $ownerPid $testRootIds $null
+        } catch {
+          throw "Could not verify RFC2217 listener ownership for test VS Code window '$Marker': $($_.Exception.Message)"
+        }
+        $listenerDescription = '{0}:{1} pid={2} process={3}' -f $listener.LocalAddress,$listener.LocalPort,$ownerPid,$processName
+        if (-not $belongsToTestWindow) {
+          throw "RFC2217 port $Port has a listener that does not belong to test VS Code window '$Marker'; refusing serial connection. Listener: $listenerDescription"
+        }
+        $details.Add("$listenerDescription; owner is in test window process tree")
+      }
+      return ($details -join '; ')
+    }
+    Start-Sleep -Milliseconds 250
+  }
+  throw "Wokwi did not expose an RFC2217 TCP listener on port $Port within $TimeoutSeconds seconds after Start Simulator. The simulator endpoint was never attached."
+}
+
+function Start-IsolatedWokwiSimulation([string]$ProjectPath) {
+  $marker = Split-Path -Leaf $ProjectPath
+  if (@(Get-IsolatedWokwiWindow $marker).Count -gt 0) {
+    throw "A VS Code window already uses the unique test project marker '$marker'; refusing to interact with it."
+  }
+  $arguments = @('--new-window', $ProjectPath)
+  $argumentLine = (@($arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
+  $null = Start-Process -FilePath $script:vsCodePath -ArgumentList $argumentLine -PassThru -WindowStyle Normal
+  $deadline = (Get-Date).AddSeconds(60)
+  while ((Get-Date) -lt $deadline) {
+    $windows = @(Get-IsolatedWokwiWindow $marker)
+    if ($windows.Count -eq 1) {
+      try {
+        Send-IsolatedWokwiCommand $marker 'Wokwi: Start Simulator'
+        Start-Sleep -Milliseconds 1200
+        Focus-IsolatedWokwiWindow $marker
+        return $marker
+      } catch {
+        Stop-IsolatedWokwiWindow $marker
+        throw
+      }
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  throw "VS Code did not open a test-owned window for '$marker' within 60 seconds."
+}
+
+function Stop-IsolatedWokwiWindow([string]$Marker, [string]$VcdPath = '') {
+  $windows = @(Get-IsolatedWokwiWindow $Marker)
+  if ($windows.Count -ne 1) { return }
+  $stopCommandError = ''
+  try { Send-IsolatedWokwiCommand $Marker 'Stop Simulation' } catch { $stopCommandError = Protect-DiagnosticText $_.Exception.Message }
+  if (-not [string]::IsNullOrWhiteSpace($VcdPath)) {
+    $vcdReadyBeforeClose = Wait-ForNonEmptyFile $VcdPath 15
+    Set-Content -LiteralPath (Join-Path $runDir 'nvs-runtime-wokwi-stop.log') `
+      -Value ("Stop Simulation requested before closing test window.`r`nSTOP_COMMAND_ERROR: $stopCommandError`r`nVCD_PATH: $VcdPath`r`nVCD_NONEMPTY_BEFORE_CLOSE: $vcdReadyBeforeClose") -Encoding utf8
+  }
+  $windows = @(Get-IsolatedWokwiWindow $Marker)
+  if ($windows.Count -eq 1) {
+    try {
+      $shell = New-Object -ComObject WScript.Shell
+      if ($shell.AppActivate([int]$windows[0].Id)) {
+        Start-Sleep -Milliseconds 250
+        $shell.SendKeys('^+w')
+      }
+    } catch {}
   }
 }
 
@@ -552,7 +901,7 @@ function Invoke-FullTests {
     Set-Content -LiteralPath (Join-Path $runDir 'mqtt-password-preflight.log') -Value 'PASS: GAS_MQTT_PASSWORD is present and non-empty. Its value was not recorded.' -Encoding utf8
     Add-Result 'mqtt-build-password-preflight' 'PASS' 0 'mqtt-password-preflight.log' $passwordPreflightDetail $passwordCheckStart (Get-Date) '' $false
   } else {
-    Add-Blocked 'mqtt-build-password-preflight' 'mqtt-password-preflight.log' 'GAS_MQTT_PASSWORD is missing or empty in this process. Firmware build will be skipped; set it in the same PowerShell session before running the full test runner. The runner never requests or records the password value.'
+    Add-Blocked 'mqtt-build-password-preflight' 'mqtt-password-preflight.log' 'GAS_MQTT_PASSWORD is missing or empty in this process. The production node1/node2/node3 build will be skipped; the isolated NVS test target uses no production password. The runner never requests or records a password value.'
   }
   $sourceFirmware = Join-Path $repo 'firmware'
   $isolatedFirmware = Join-Path $runDir 'isolated-source/firmware'
@@ -573,7 +922,7 @@ function Invoke-FullTests {
     $ini = Join-Path $isolatedFirmware 'platformio.ini'
     $text = Get-Content $ini -Raw
     $testHome = 'autotest-' + $runId.ToLowerInvariant()
-    $text = $text.Replace('demo-home', $testHome).Replace('MQTT_HOST="host.wokwi.internal"','MQTT_HOST="autotest.invalid"').Replace('MQTT_PORT=1883','MQTT_PORT=1884').Replace('MQTT_USER="iotlab"','MQTT_USER="autotest"')
+    $text = Set-IsolatedSimulationNodeBroker -PlatformIoText $text -TestHomeId $testHome
     Write-Utf8NoBom $ini $text
     $isolatedPioDir = Join-Path $isolatedFirmware '.pio'
     $isolatedArtifactTreeIsFresh = -not (Test-Path -LiteralPath $isolatedPioDir)
@@ -607,9 +956,7 @@ function Invoke-FullTests {
           }
         } catch { $missingPackages.Add("$packageName (manifest unreadable)") }
       }
-      if ([string]::IsNullOrWhiteSpace($env:GAS_MQTT_PASSWORD)) {
-        Add-Blocked 'firmware-build-node1-node2-node3' 'firmware-build.log' 'Build skipped before PlatformIO launch because GAS_MQTT_PASSWORD is missing or empty in this process. Set the variable in the same PowerShell session and rerun; no credential was logged.'
-      } elseif (-not $isolatedArtifactTreeIsFresh) {
+      if (-not $isolatedArtifactTreeIsFresh) {
         Add-Blocked 'firmware-build-node1-node2-node3' 'firmware-build.log' 'Build skipped because the isolated .pio output tree was not empty before build; refusing possible stale-artifact reuse.'
       } elseif ($missingPackages.Count -gt 0) {
         Add-Blocked 'platformio-toolchain-preflight' 'platformio-toolchain-preflight.log' ('Refusing implicit PlatformIO package install/upgrade; required installed package set is incomplete or mismatched: ' + ($missingPackages -join ', '))
@@ -624,7 +971,9 @@ function Invoke-FullTests {
         Invoke-LoggedProcess 'platformio-toolchain-preflight' $compilerPath @('--version') $repo 'platformio-toolchain-preflight.log' 20 'Direct launch of the exact Xtensa compiler executable required by PlatformIO.'
         Add-Content -LiteralPath (Join-Path $runDir 'platformio-toolchain-preflight.log') -Value ("`r`n" + $preflightMetadata) -Encoding utf8
         $preflightResult = $script:tests | Where-Object { $_.name -eq 'platformio-toolchain-preflight' } | Select-Object -Last 1
-        if ($preflightResult.status -eq 'PASS') {
+        if ($preflightResult.status -eq 'PASS' -and [string]::IsNullOrWhiteSpace($env:GAS_MQTT_PASSWORD)) {
+          Add-Blocked 'firmware-build-node1-node2-node3' 'firmware-build.log' 'Production node build skipped because GAS_MQTT_PASSWORD is missing or empty in this process. No credential was logged.'
+        } elseif ($preflightResult.status -eq 'PASS') {
           Invoke-LoggedProcess 'firmware-build-node1-node2-node3' $script:python.Source @('-m','platformio','run','-d',$isolatedFirmware,'-e','node1','-e','node2','-e','node3') $repo 'firmware-build.log' 600 'Fresh source build in isolated run folder; exact preinstalled PlatformIO packages are reused and no package download/upgrade is allowed. GAS_MQTT_PASSWORD is inherited through the child environment only and is not included in arguments or logs.'
         } else {
           Add-Blocked 'firmware-build-node1-node2-node3' 'firmware-build.log' 'Build skipped because the exact Xtensa compiler executable failed its direct launch preflight; see platformio-toolchain-preflight.log and runner-errors.log.'
@@ -650,7 +999,7 @@ function Invoke-FullTests {
         $scenario = 'scenarios/' + $node + '.yaml'
         $vcd = Join-Path $runDir ($node + '-gpio.vcd')
         if (Test-Path (Join-Path $simDir $scenario)) {
-          Invoke-LoggedProcess ('wokwi-' + $node) $script:wokwiPath @($simDir,'--scenario',$scenario,'--timeout','60000','--timeout-exit-code','124','--serial-log-file',(Join-Path $runDir ($node + '-serial.log')),'--vcd-file',$vcd) $repo ('wokwi-' + $node + '.log') 180 'Wokwi simulation in an isolated source copy. GPIO VCD is collected when supported.'
+          Invoke-WokwiNodeScenarioWithRetry ('wokwi-' + $node) $script:wokwiPath @($simDir,'--scenario',$scenario,'--timeout','60000','--timeout-exit-code','124','--serial-log-file',(Join-Path $runDir ($node + '-serial.log')),'--vcd-file',$vcd) $repo ('wokwi-' + $node + '.log') 180 'Wokwi simulation in an isolated source copy. GPIO VCD is collected when supported.'
           $simResult = $script:tests | Where-Object { $_.name -eq ('wokwi-' + $node) } | Select-Object -Last 1
           if ($simResult -and $simResult.status -eq 'PASS') {
             Invoke-LoggedProcess ('wokwi-serial-observations-' + $node) $script:python.Source @('tools/verify_wokwi_serial.py',$node,(Join-Path $runDir ($node + '-serial.log'))) $repo ('wokwi-' + $node + '-serial-check.log') 30 'Ordered state transitions and emitted sample timing rows; Wokwi evidence only.'
@@ -669,6 +1018,38 @@ function Invoke-FullTests {
     } else {
       foreach ($node in @('node1','node2','node3')) { Add-Blocked ('wokwi-' + $node) ('wokwi-' + $node + '.log') 'Firmware build result is unavailable; scenario was not run.' }
     }
+
+    $faultScenarioName = 'wokwi-node3-sensor-faults'
+    $faultVcd = Join-Path $runDir 'node3-sensor-faults-gpio.vcd'
+    $faultSerial = Join-Path $runDir 'node3-sensor-faults-serial.log'
+    if ($buildResult -and $buildResult.status -eq 'PASS' -and $artifactResult -and $artifactResult.status -eq 'PASS' -and $script:wokwiPath -and $script:wokwiTokenPresent) {
+      $faultSimDir = Join-Path $isolatedFirmware 'sim/node3'
+      $faultScenario = 'scenarios/sensor-faults.yaml'
+      if (Test-Path -LiteralPath (Join-Path $faultSimDir $faultScenario) -PathType Leaf) {
+        Invoke-WokwiNodeScenarioWithRetry $faultScenarioName $script:wokwiPath @($faultSimDir,'--scenario',$faultScenario,'--timeout','60000','--timeout-exit-code','124','--serial-log-file',$faultSerial,'--vcd-file',$faultVcd) $repo ($faultScenarioName + '.log') 180 'Wokwi Node 3 CO-only and dual-sensor FAULT/recovery scenario with serial and GPIO VCD evidence; simulation only.'
+        $faultResult = $script:tests | Where-Object { $_.name -eq $faultScenarioName } | Select-Object -Last 1
+        if ($faultResult -and $faultResult.status -eq 'PASS') {
+          Invoke-LoggedProcess 'wokwi-node3-sensor-faults-gpio-vcd' $script:python.Source @('tools/verify_wokwi_vcd.py',$faultVcd) $repo 'wokwi-node3-sensor-faults-gpio-vcd.log' 30 'Independent simulated GPIO VCD checks for FAULT LED/buzzer activity; not physical sensor evidence.'
+        } else {
+          Add-Blocked 'wokwi-node3-sensor-faults-gpio-vcd' 'wokwi-node3-sensor-faults-gpio-vcd.log' 'CO/dual-FAULT scenario did not PASS, so its GPIO VCD was not accepted.'
+        }
+      } else {
+        Add-Blocked $faultScenarioName ($faultScenarioName + '.log') "Sensor-fault Wokwi scenario is missing: $faultScenario"
+        Add-Blocked 'wokwi-node3-sensor-faults-gpio-vcd' 'wokwi-node3-sensor-faults-gpio-vcd.log' 'Sensor-fault scenario was unavailable.'
+      }
+    } elseif (-not $buildResult -or $buildResult.status -ne 'PASS') {
+      Add-Blocked $faultScenarioName ($faultScenarioName + '.log') 'Fresh three-node firmware build did not PASS; sensor-fault scenario was not run.'
+      Add-Blocked 'wokwi-node3-sensor-faults-gpio-vcd' 'wokwi-node3-sensor-faults-gpio-vcd.log' 'Fresh firmware build did not PASS.'
+    } elseif (-not $artifactResult -or $artifactResult.status -ne 'PASS') {
+      Add-Blocked $faultScenarioName ($faultScenarioName + '.log') 'Fresh node3 firmware artifact validation did not PASS; sensor-fault scenario was not run.'
+      Add-Blocked 'wokwi-node3-sensor-faults-gpio-vcd' 'wokwi-node3-sensor-faults-gpio-vcd.log' 'Fresh node3 artifact validation did not PASS.'
+    } elseif (-not $script:wokwiPath) {
+      Add-Blocked $faultScenarioName ($faultScenarioName + '.log') 'Wokwi CLI is unavailable; CO/dual-FAULT runtime was not run.'
+      Add-Blocked 'wokwi-node3-sensor-faults-gpio-vcd' 'wokwi-node3-sensor-faults-gpio-vcd.log' 'Wokwi runtime was unavailable.'
+    } else {
+      Add-Blocked $faultScenarioName ($faultScenarioName + '.log') 'WOKWI_CLI_TOKEN is not present in the current process environment; CO/dual-FAULT runtime was not run.'
+      Add-Blocked 'wokwi-node3-sensor-faults-gpio-vcd' 'wokwi-node3-sensor-faults-gpio-vcd.log' 'CO/dual-FAULT runtime did not run because Wokwi authentication was unavailable.'
+    }
   } catch {
     $runnerError = $_
     Write-RunnerDiagnostic 'firmware-build-node1-node2-node3' '<prepare-isolated-firmware-copy>' 'RUNNER_ERROR_DURING_PREPARATION' $runnerError
@@ -676,14 +1057,148 @@ function Invoke-FullTests {
     foreach ($node in @('node1','node2','node3')) { Add-Blocked ('wokwi-' + $node) ('wokwi-' + $node + '.log') 'Isolated build source could not be prepared.' }
   }
 
-  $runtimeBuild = $script:tests | Where-Object { $_.name -eq 'firmware-build-node1-node2-node3' } | Select-Object -Last 1
-  $runtimeReasons = [System.Collections.Generic.List[string]]::new()
-  if (-not $runtimeBuild -or $runtimeBuild.status -ne 'PASS') { $runtimeReasons.Add('fresh firmware build did not PASS') }
-  if (-not $script:wokwiPath) { $runtimeReasons.Add('Wokwi CLI is unavailable') }
-  if (-not $script:wokwiTokenPresent) { $runtimeReasons.Add('WOKWI_CLI_TOKEN is absent from this process environment') }
-  $runtimeReasons.Add('no firmware-backed NVS offline/reconnect/replay/application-ACK driver is implemented; the MQTT/SQLite harness uses synthetic clients')
-  $runtimeReasonText = if ($runtimeReasons.Count) { ' Blocking conditions: ' + ($runtimeReasons -join '; ') + '.' } else { '' }
-  Add-Blocked 'firmware-nvs-offline-replay-runtime' 'nvs-replay.log' ("Firmware/NVS replay was not executed.$runtimeReasonText")
+  $securitySourceTests = Join-Path $repo 'tools/e2e/test_mqtt_security_static.py'
+  $securityHarness = Join-Path $repo 'tools/e2e/mqtt_security_harness.py'
+  $securityCaPath = Join-Path $runDir 'mqtt-security-test-ca.pem'
+  if ($script:python -and (Test-Path -LiteralPath $securitySourceTests -PathType Leaf) -and (Test-Path -LiteralPath $securityHarness -PathType Leaf)) {
+    Invoke-LoggedProcess 'mqtt-security-test-ca-fixture' $script:python.Source @($securityHarness,'--write-ca',$securityCaPath) $repo 'mqtt-security-test-ca.log' 60 'Generates disposable public test CA PEM in this run directory; no private key or credential is retained.'
+    $caFixtureResult = $script:tests | Where-Object { $_.name -eq 'mqtt-security-test-ca-fixture' } | Select-Object -Last 1
+    $toolchainResult = $script:tests | Where-Object { $_.name -eq 'platformio-toolchain-preflight' } | Select-Object -Last 1
+    if ($caFixtureResult -and $caFixtureResult.status -eq 'PASS' -and $toolchainResult -and $toolchainResult.status -eq 'PASS' -and $script:pioModule -and $isolatedFirmware) {
+      $script:mqttCaCertPath = $securityCaPath
+      Invoke-LoggedProcess 'firmware-build-mqtt-tls-compile' $script:python.Source @('-m','platformio','run','-d',$isolatedFirmware,'-e','node1_mqtt_tls_compile') $repo 'firmware-mqtt-tls-build.log' 300 'Compile-only secure transport profile using the run-local ephemeral CA; no broker connection and no production credential.'
+    } else {
+      Add-Blocked 'firmware-build-mqtt-tls-compile' 'firmware-mqtt-tls-build.log' 'Compile-only TLS profile was skipped because the CA fixture, PlatformIO, or direct Xtensa compiler preflight did not PASS.'
+    }
+    Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'TLS firmware runtime was not run: this target is compile-only and no firmware-backed TLS broker session is configured in this runner.'
+    if ($script:python -and $script:mosquitto -and $script:mosquittoPasswd -and
+        (Test-Path -LiteralPath $script:mosquitto.Source -PathType Leaf) -and
+        (Test-Path -LiteralPath $script:mosquittoPasswd.Source -PathType Leaf)) {
+      $mosquittoRuntimeOutput = Join-Path $runDir 'mosquitto-runtime'
+      Invoke-LoggedProcess 'mqtt-security-mosquitto-runtime' $script:python.Source @(
+        'tools/e2e/mosquitto_security_runtime.py',
+        '--mosquitto-exe',$script:mosquitto.Source,
+        '--mosquitto-passwd-exe',$script:mosquittoPasswd.Source,
+        '--output-dir',$mosquittoRuntimeOutput
+      ) $repo 'mqtt-security-mosquitto-runtime.log' 60 "Real Mosquitto $script:mosquittoVersion loopback TLS/auth/ACL runtime adapter; generated test credentials and certificates are disposable."
+    } else {
+      Add-Blocked 'mqtt-security-mosquitto-runtime' 'mqtt-security-mosquitto-runtime.log' 'A real Mosquitto executable, mosquitto_passwd, or Python runtime is unavailable; runtime security tests were not run.'
+    }
+  } else {
+    Add-Blocked 'mqtt-security-test-ca-fixture' 'mqtt-security-test-ca.log' 'Python security harness or source regression suite is unavailable.'
+    Add-Blocked 'firmware-build-mqtt-tls-compile' 'firmware-mqtt-tls-build.log' 'Compile-only TLS profile was not built because its CA fixture could not be prepared.'
+    Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'TLS firmware runtime was not run because the security harness is unavailable.'
+    Add-Blocked 'mqtt-security-mosquitto-runtime' 'mqtt-security-mosquitto-runtime.log' 'Mosquitto runtime integration was not run because the security harness is unavailable.'
+  }
+
+  $runtimeToolchainPreflight = $script:tests | Where-Object { $_.name -eq 'platformio-toolchain-preflight' } | Select-Object -Last 1
+  if ($runtimeToolchainPreflight -and $runtimeToolchainPreflight.status -eq 'PASS' -and $script:python -and $script:pioModule -and $isolatedFirmware -and $isolatedArtifactTreeIsFresh) {
+    Invoke-LoggedProcess 'firmware-build-nvs-runtime' $script:python.Source @('-m','platformio','run','-d',$isolatedFirmware,'-e','node1_nvs_runtime') $repo 'firmware-nvs-runtime-build.log' 300 'Fresh isolated simulation test firmware build; its dedicated target uses no production password and connects only to the loopback-only test broker through Wokwi Private Gateway.'
+  } elseif (-not $script:python) {
+    Add-Blocked 'firmware-build-nvs-runtime' 'firmware-nvs-runtime-build.log' 'Python/PlatformIO is unavailable; isolated NVS runtime firmware was not built.'
+  } else {
+    Add-Blocked 'firmware-build-nvs-runtime' 'firmware-nvs-runtime-build.log' 'Isolated NVS runtime firmware build was skipped because PlatformIO/compiler preflight, source isolation, or Python availability did not PASS.'
+  }
+
+  $runtimeBuild = $script:tests | Where-Object { $_.name -eq 'firmware-build-nvs-runtime' } | Select-Object -Last 1
+  if (-not $runtimeBuild -or $runtimeBuild.status -ne 'PASS') {
+    Add-Blocked 'firmware-nvs-offline-replay-runtime' 'nvs-replay.log' 'Firmware-backed NVS replay driver was not started because its fresh test firmware build did not PASS; see firmware-nvs-runtime-build.log.'
+  } else {
+    $runtimeBin = Join-Path $isolatedFirmware '.pio/build/node1_nvs_runtime/firmware.bin'
+    $runtimeElf = Join-Path $isolatedFirmware '.pio/build/node1_nvs_runtime/firmware.elf'
+    $artifactStart = Get-Date
+    if ((Test-Path -LiteralPath $runtimeBin -PathType Leaf) -and (Test-Path -LiteralPath $runtimeElf -PathType Leaf) -and (Get-Item -LiteralPath $runtimeBin).Length -gt 0 -and (Get-Item -LiteralPath $runtimeElf).Length -gt 0) {
+      $artifactMessage = "PASS: fresh NVS runtime BIN/ELF exist under this run's isolated .pio tree."
+      Set-Content -LiteralPath (Join-Path $runDir 'nvs-runtime-artifact-validation.log') -Value $artifactMessage -Encoding utf8
+      Add-Result 'nvs-runtime-artifact-validation' 'PASS' 0 'nvs-runtime-artifact-validation.log' $artifactMessage $artifactStart (Get-Date) '' $false
+      $runtimeSimDir = Join-Path $runDir 'nvs-runtime-wokwi'
+      try {
+        New-Item -ItemType Directory -Path $runtimeSimDir -Force | Out-Null
+        $runtimeDiagram = Get-Content -LiteralPath (Join-Path $isolatedFirmware 'sim/node1/diagram.json') -Raw
+        $runtimeDiagram = Set-NvsRuntimeLogicAnalyzerTrigger -DiagramJson $runtimeDiagram
+        Write-Utf8NoBom (Join-Path $runtimeSimDir 'diagram.json') $runtimeDiagram
+        $runtimeRfc2217Port = Get-FreeNvsRuntimeRfc2217Port
+        $runtimeWokwi = New-NvsRuntimeWokwiConfig -FirmwareRelativePath '../isolated-source/firmware/.pio/build/node1_nvs_runtime/firmware.bin' -ElfRelativePath '../isolated-source/firmware/.pio/build/node1_nvs_runtime/firmware.elf' -Rfc2217ServerPort $runtimeRfc2217Port -VcdRelativePath 'nvs-runtime-gpio.vcd'
+        Write-Utf8NoBom (Join-Path $runtimeSimDir 'wokwi.toml') $runtimeWokwi
+        if (-not $script:vsCodePath) {
+          Add-Blocked 'firmware-nvs-offline-replay-runtime' 'nvs-replay.log' 'The local firmware runtime test requires Wokwi for VS Code with its Private IoT Gateway; the VS Code CLI was not found. Wokwi CLI cloud cannot reach the loopback test broker.'
+        } elseif (-not $script:wokwiVscodeExtensionPath -or -not (Test-Path -LiteralPath (Join-Path $script:wokwiVscodeExtensionPath 'package.json') -PathType Leaf)) {
+          Add-Blocked 'firmware-nvs-offline-replay-runtime' 'nvs-replay.log' 'The local firmware runtime test requires the Wokwi VS Code extension, which was not found in the current user extension directory.'
+        } else {
+            $runtimeWindowMarker = $null
+            $runtimeDriverWasStarted = $false
+            try {
+              $runtimeWindowMarker = Start-IsolatedWokwiSimulation $runtimeSimDir
+              $listenerEvidence = Wait-IsolatedWokwiRfc2217Listener $runtimeRfc2217Port $runtimeWindowMarker 25
+              Set-Content -LiteralPath (Join-Path $runDir 'nvs-runtime-wokwi-launch.log') -Value ("Opened the unique test VS Code window, started Wokwi, and foregrounded it.`r`nSelected dual-stack RFC2217 port: $runtimeRfc2217Port`r`nRFC2217 listener: $listenerEvidence`r`nThe runtime driver verifies the protocol handshake.") -Encoding utf8
+              $runtimeDriverWasStarted = $true
+               Invoke-LoggedProcess 'firmware-nvs-offline-replay-runtime' $script:python.Source @('tools/e2e/firmware_nvs_replay.py','--phase','both','--output-dir',$runDir,'--serial-debug','--serial-url',"rfc2217://127.0.0.1:$runtimeRfc2217Port") $repo 'nvs-replay.log' 600 'Actual firmware-backed local Wokwi run covers LPG DANGER plus LPG/CO FAULT offline, reboot persistence, SQLite commit, application ACK, exact NVS removal, and GPIO VCD. Broker is loopback-only on 1884; app ACK is distinct from QoS 1 PUBACK.'
+            } catch {
+              $launchError = Protect-DiagnosticText $_.Exception.Message
+              Set-Content -LiteralPath (Join-Path $runDir 'nvs-runtime-wokwi-launch.log') -Value ("BLOCKED: could not open the isolated Wokwi VS Code test project.`r`nDETAIL: $launchError") -Encoding utf8
+              Add-Blocked 'firmware-nvs-offline-replay-runtime' 'nvs-replay.log' "Could not launch the isolated local Wokwi test project: $launchError"
+            } finally {
+              if ($runtimeWindowMarker) { Stop-IsolatedWokwiWindow $runtimeWindowMarker (Join-Path $runtimeSimDir 'nvs-runtime-gpio.vcd') }
+            }
+            $runtimeDriverResult = $script:tests | Where-Object { $_.name -eq 'firmware-nvs-offline-replay-runtime' } | Select-Object -Last 1
+            if ($runtimeDriverResult -and $runtimeDriverResult.status -eq 'PASS') {
+              $runtimeVcd = Join-Path $runtimeSimDir 'nvs-runtime-gpio.vcd'
+              $vcdDeadline = (Get-Date).AddSeconds(20)
+              while ((Get-Date) -lt $vcdDeadline -and (-not (Test-Path -LiteralPath $runtimeVcd -PathType Leaf) -or (Get-Item -LiteralPath $runtimeVcd).Length -eq 0)) { Start-Sleep -Milliseconds 250 }
+              if ((Test-Path -LiteralPath $runtimeVcd -PathType Leaf) -and ((Get-Item -LiteralPath $runtimeVcd).Length -gt 0)) {
+                Invoke-LoggedProcess 'nvs-runtime-gpio-vcd' $script:python.Source @('tools/e2e/verify_nvs_runtime_vcd.py',$runtimeVcd) $repo 'nvs-runtime-gpio-vcd.log' 30 'Independent Wokwi logic-analyzer trace confirms simulated GPIO7 red and GPIO4 buzzer activity; not physical hardware evidence.'
+                $gpioResult = $script:tests | Where-Object { $_.name -eq 'nvs-runtime-gpio-vcd' } | Select-Object -Last 1
+                if ($gpioResult -and $gpioResult.status -ne 'PASS') {
+                  Set-ExistingResultStatus 'firmware-nvs-offline-replay-runtime' $gpioResult.status $gpioResult.exit_code "Firmware MQTT/NVS/ACK path completed, but required simulated GPIO VCD assertion did not PASS. See nvs-runtime-gpio-vcd.log. $($gpioResult.detail)"
+                }
+              } else {
+                Add-Blocked 'nvs-runtime-gpio-vcd' 'nvs-runtime-gpio-vcd.log' 'Wokwi runtime completed, but no non-empty configured logic-analyzer VCD was saved; LED/buzzer pin behavior was not independently verified.'
+                Set-ExistingResultStatus 'firmware-nvs-offline-replay-runtime' 'BLOCKED' 127 'Firmware MQTT/NVS/ACK path completed, but Wokwi did not produce the required simulated GPIO VCD; see nvs-runtime-gpio-vcd.log.'
+              }
+            } elseif ($runtimeDriverWasStarted) {
+              Add-NotTested 'nvs-runtime-gpio-vcd' 'nvs-runtime-gpio-vcd.log' 'The firmware NVS runtime process started but did not PASS, so its alarm GPIO trace was not accepted.'
+            }
+        }
+      } catch {
+        $runtimeSetupError = Protect-DiagnosticText $_.Exception.Message
+        Add-Blocked 'firmware-nvs-offline-replay-runtime' 'nvs-replay.log' "Could not prepare the isolated local Wokwi runtime project: $runtimeSetupError"
+      }
+    } else {
+      $artifactMessage = 'FAIL: NVS runtime firmware build returned PASS but its fresh BIN/ELF artifacts were missing or empty.'
+      Set-Content -LiteralPath (Join-Path $runDir 'nvs-runtime-artifact-validation.log') -Value $artifactMessage -Encoding utf8
+      Add-Result 'nvs-runtime-artifact-validation' 'FAIL' 1 'nvs-runtime-artifact-validation.log' $artifactMessage $artifactStart (Get-Date) '' $false
+      Add-Blocked 'firmware-nvs-offline-replay-runtime' 'nvs-replay.log' 'Firmware-backed NVS runtime was not started because its fresh firmware artifacts failed validation.'
+    }
+  }
+
+  if (@($script:tests | Where-Object { $_.name -eq 'nvs-runtime-gpio-vcd' }).Count -eq 0) {
+    Add-NotTested 'nvs-runtime-gpio-vcd' 'nvs-runtime-gpio-vcd.log' 'No completed NVS runtime simulator session was available to export and inspect a Wokwi pin trace.'
+  }
+  $finalNvsResult = $script:tests | Where-Object { $_.name -eq 'firmware-nvs-offline-replay-runtime' } | Select-Object -Last 1
+  if ($finalNvsResult) {
+    $finalNvsJson = [pscustomobject]@{
+      timestamp_utc = (Get-Date).ToUniversalTime().ToString('o')
+      stage = 'RUNNER_FINAL_ACCEPTANCE'
+      status = $finalNvsResult.status
+      detail = $finalNvsResult.detail
+    } | ConvertTo-Json -Compress
+    [System.IO.File]::AppendAllText((Join-Path $runDir 'nvs-replay.log'), $finalNvsJson + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    $runtimeTimelinePath = Join-Path $runDir 'nvs-runtime-timeline.csv'
+    if (-not (Test-Path -LiteralPath $runtimeTimelinePath -PathType Leaf)) {
+      $timelineRow = [pscustomobject]@{
+        timestamp_utc = (Get-Date).ToUniversalTime().ToString('o')
+        stage = 'NOT_TESTED'
+        device_id = ''
+        boot_id = ''
+        seq = ''
+        queue_count = ''
+        payload_sha256 = ''
+        detail = "Firmware runtime driver did not produce event observations. Final status: $($finalNvsResult.status). $($finalNvsResult.detail)"
+      }
+      $timelineCsv = @($timelineRow | ConvertTo-Csv -NoTypeInformation) -join "`r`n"
+      [System.IO.File]::WriteAllText($runtimeTimelinePath, $timelineCsv + "`r`n", [System.Text.UTF8Encoding]::new($false))
+    }
+  }
 
 }
 
@@ -712,7 +1227,13 @@ Write-EmptyLog 'wokwi-node3-serial.log' 'NOT CAPTURED: Wokwi CLI did not produce
 Write-EmptyLog 'wokwi-node1-serial-check.log' 'NOT TESTED: Wokwi serial runtime was blocked or not requested.'
 Write-EmptyLog 'wokwi-node2-serial-check.log' 'NOT TESTED: Wokwi serial runtime was blocked or not requested.'
 Write-EmptyLog 'wokwi-node3-serial-check.log' 'NOT TESTED: Wokwi serial runtime was blocked or not requested.'
+Write-EmptyLog 'wokwi-node3-sensor-faults.log' 'NOT TESTED: quick mode does not run the extra CO/dual-FAULT Wokwi scenario.'
+Write-EmptyLog 'wokwi-node3-sensor-faults-gpio-vcd.log' 'NOT TESTED: quick mode does not capture CO/dual-FAULT GPIO VCD.'
 Write-EmptyLog 'mqtt-integration.log' 'NOT TESTED: quick mode does not run MQTT integration.'
+Write-EmptyLog 'mqtt-security-test-ca.log' 'NOT TESTED: quick mode does not generate a TLS compile-test CA.'
+Write-EmptyLog 'firmware-mqtt-tls-build.log' 'NOT TESTED: quick mode does not compile the TLS firmware profile.'
+Write-EmptyLog 'firmware-mqtt-tls-runtime.log' 'NOT TESTED: no firmware TLS runtime was executed.'
+Write-EmptyLog 'mqtt-security-mosquitto-runtime.log' 'NOT TESTED: quick mode does not run Mosquitto compatibility tests.'
 Write-EmptyLog 'nvs-replay.log' 'NOT TESTED: no firmware NVS runtime replay was executed.'
 
 $endedUtc = (Get-Date).ToUniversalTime()

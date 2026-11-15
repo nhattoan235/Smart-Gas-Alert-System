@@ -77,7 +77,11 @@ AlarmState Detector::update(float signal, bool valid, uint32_t now) {
   } else filtered_=0.35f*smooth+0.65f*filtered_;
   float delta=filtered_-baseline_;
   bool high=smooth>=65 || filtered_>=62;
-  bool warning=filtered_>=28 || delta>=20;
+  // The EMA approaches its steady value asymptotically. Allow only a tiny
+  // float-rounding tolerance so an input exactly on the declared relative
+  // warning boundary remains reachable after filtering.
+  const float warningDeltaFloatTolerance = 0.00001f;
+  bool warning=filtered_>=28 || delta + warningDeltaFloatTolerance >= 20;
   // A small but persistent rise is worth watching, never a calibrated leak claim.
   if (delta>=4 && filtered_>=7) slowRiseSince_.start(now);
   else slowRiseSince_.reset();

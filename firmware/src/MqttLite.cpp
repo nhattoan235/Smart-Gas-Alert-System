@@ -1,7 +1,11 @@
 #include "MqttLite.h"
+#include "MqttCredentials.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
+#ifndef MQTT_CA_CERT
+#define MQTT_CA_CERT ""
+#endif
 static size_t putString(uint8_t *out,const char *s) { size_t n=strlen(s); out[0]=n>>8; out[1]=n&255; memcpy(out+2,s,n); return n+2; }
 bool MqttLite::writePacket(uint8_t header,const uint8_t *body,size_t length) {
   if (!client_.connected()) return false;
@@ -11,11 +15,18 @@ bool MqttLite::writePacket(uint8_t header,const uint8_t *body,size_t length) {
   lastActivity_=millis(); return true;
 }
 bool MqttLite::connect(const char *host,uint16_t port,const char *id,const char *user,const char *pass,const char *willTopic,const char *willPayload) {
+  if(!host || !*host) return false;
   size_t payloadSize=16+strlen(id)+strlen(willTopic)+strlen(willPayload);
   if(user && *user) payloadSize+=2+strlen(user);
   if(pass && *pass) payloadSize+=2+strlen(pass);
   if(payloadSize>512) return false;
   client_.stop(); rxLen_=0; ackHead_=ackCount_=0; client_.setTimeout(2);
+#if MQTT_TLS
+  // TLS mode fails closed: a missing CA is a configuration error, never a
+  // reason to fall back to plaintext or disable certificate verification.
+  if(!MQTT_CA_CERT[0]) return false;
+  client_.setCACert(MQTT_CA_CERT);
+#endif
   if(!client_.connect(host,port,750)) return false;
   uint8_t body[512]; size_t i=0;
   i+=putString(body+i,"MQTT"); body[i++]=4;

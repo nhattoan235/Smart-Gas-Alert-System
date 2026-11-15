@@ -12,7 +12,7 @@
 
 - Không biểu diễn Wokwi là cảm biến MQ được kiểm định hoặc đổi tín hiệu giả lập sang ppm/%LEL.
 - LPG và CO có đường cảnh báo riêng; không chờ cloud hoặc sự đồng thuận của khí kia.
-- Broker Ubuntu người dùng đã cung cấp địa chỉ `192.168.22.128:1883`, tài khoản `iotlab`; mật khẩu được đưa vào lúc build/chạy bằng biến môi trường, không lưu trong repo.
+- Broker MQTT được cấu hình riêng theo môi trường triển khai; tài khoản và mật khẩu không lưu trong repository.
 - Không điều khiển van gas thật.
 
 ## Review Focus

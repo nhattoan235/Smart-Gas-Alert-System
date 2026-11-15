@@ -3,7 +3,9 @@
 #include <Preferences.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <freertos/queue.h>
@@ -13,6 +15,9 @@
 #include "EventQueueNvs.h"
 #include "MqttLite.h"
 #include "MqttCredentials.h"
+#if defined(NVS_RUNTIME_TEST) && NVS_RUNTIME_TEST
+#include "esp_attr.h"
+#endif
 #ifndef SIMULATION
 #define SIMULATION 1
 #endif
@@ -21,6 +26,12 @@
 #endif
 #ifndef N8R8_SENSOR_CONFIGURED
 #define N8R8_SENSOR_CONFIGURED 0
+#endif
+#ifndef NVS_RUNTIME_TEST
+#define NVS_RUNTIME_TEST 0
+#endif
+#if NVS_RUNTIME_TEST && !SIMULATION
+#error "NVS runtime test controls are available only in the isolated simulation build."
 #endif
 #if !SIMULATION && !HARDWARE_N8R8
 #error "Select either a simulation environment or an explicit hardware environment."
@@ -137,6 +148,114 @@ static uint32_t eventSentAt=0;
 static uint32_t eventLastAttemptAt=0;
 static uint32_t lastSampleUs=0,maxSampleGapUs=0,maxAcquireToAlarmUs=0,maxSampleConditionToAlarmUs=0,missedSamplePeriods=0;
 static uint32_t lastMetricsPrint=0;
+#if NVS_RUNTIME_TEST
+static constexpr uint32_t NVS_TEST_RTC_MAGIC=0x4E565354UL;
+RTC_DATA_ATTR static uint32_t nvsTestRtcMagic=0;
+RTC_DATA_ATTR static int nvsTestLpgRaw=-1;
+static bool nvsTestLpgInvalid=false;
+static bool nvsTestCoInvalid=false;
+static char nvsTestCommand[64];
+static size_t nvsTestCommandLength=0;
+static void dumpNvsRuntimeTestQueue();
+
+static void printNvsRuntimeTestEventRecord(const char *device,const char *eventBoot,
+                                           uint32_t eventSeq,const char *data) {
+  // Keep each test-only UART record short; the host validates every fragment
+  // and fails closed if a concurrent ESP-IDF diagnostic corrupts one.
+  constexpr size_t chunkBytes=16;
+  const size_t payloadBytes=strlen(data);
+  const unsigned chunks=(unsigned)((payloadBytes+chunkBytes-1)/chunkBytes);
+  Serial.printf("nvs_test_event_record_begin device_id=%s boot_id=%s seq=%lu payload_bytes=%u chunks=%u\n",
+    device,eventBoot,(unsigned long)eventSeq,(unsigned)payloadBytes,chunks);
+  for(unsigned part=0;part<chunks;part++) {
+    const size_t offset=(size_t)part*chunkBytes;
+    const size_t remaining=payloadBytes-offset;
+    const int length=(int)(remaining<chunkBytes ? remaining : chunkBytes);
+    Serial.printf("nvs_test_event_record_chunk device_id=%s boot_id=%s seq=%lu part=%u data=%.*s\n",
+      device,eventBoot,(unsigned long)eventSeq,part,length,data+offset);
+  }
+  Serial.printf("nvs_test_event_record_end device_id=%s boot_id=%s seq=%lu chunks=%u\n",
+    device,eventBoot,(unsigned long)eventSeq,chunks);
+}
+
+static void processNvsRuntimeTestCommand(const char *command) {
+  int raw=-1;
+  char extra=0;
+  if(sscanf(command,"NVS_TEST SET_LPG_ADC %d %c",&raw,&extra)==1 &&
+     raw>=0 && raw<=4095) {
+    nvsTestLpgRaw=raw;
+    Serial.printf("nvs_test_control outcome=accepted command=set_lpg_adc raw=%d\n",raw);
+    return;
+  }
+  if(strcmp(command,"NVS_TEST CLEAR_LPG_ADC")==0) {
+    nvsTestLpgRaw=-1;
+    Serial.println("nvs_test_control outcome=accepted command=clear_lpg_adc");
+    return;
+  }
+  char sensor[12]={0};
+  int invalid=-1;
+  char sensorExtra=0;
+  if(sscanf(command,"NVS_TEST SET_SENSOR_INVALID %11s %d %c",sensor,&invalid,&sensorExtra)==2 &&
+     (invalid==0 || invalid==1)) {
+    if(strcmp(sensor,"LPG")==0) {
+      nvsTestLpgInvalid=invalid!=0;
+    } else if(strcmp(sensor,"CO")==0) {
+      nvsTestCoInvalid=invalid!=0;
+    } else if(strcmp(sensor,"BOTH")==0) {
+      nvsTestLpgInvalid=invalid!=0;
+      nvsTestCoInvalid=invalid!=0;
+    } else {
+      Serial.println("nvs_test_control outcome=rejected command=set_sensor_invalid reason=unknown_sensor");
+      return;
+    }
+    Serial.printf("nvs_test_control outcome=accepted command=set_sensor_invalid sensor=%s invalid=%u\n",
+      sensor,(unsigned)invalid);
+    return;
+  }
+  if(strcmp(command,"NVS_TEST STATUS")==0) {
+    const bool mqttConnected=mqttEventGroup &&
+        (xEventGroupGetBits(mqttEventGroup)&MQTT_CONNECTED_BIT);
+    Serial.printf("nvs_test_status device_id=%s boot_id=%s seq=%lu queue_count=%u mqtt_connected=%u lpg_override=%d lpg_invalid_test=%u co_invalid_test=%u red_pin=%d buzzer_duty=%u\n",
+      DEVICE_ID,bootId.c_str(),(unsigned long)seq,(unsigned)eventCount,
+      mqttConnected ? 1U : 0U,nvsTestLpgRaw,(unsigned)nvsTestLpgInvalid,
+      (unsigned)nvsTestCoInvalid,digitalRead(RED),
+      (unsigned)ledcRead(0));
+    return;
+  }
+  if(strcmp(command,"NVS_TEST DUMP_QUEUE")==0) {
+    dumpNvsRuntimeTestQueue();
+    return;
+  }
+  if(strcmp(command,"NVS_TEST REBOOT")==0) {
+    Serial.printf("nvs_test_control outcome=accepted command=reboot boot_id=%s queue_count=%u\n",
+      bootId.c_str(),(unsigned)eventCount);
+    Serial.flush();
+    delay(50);
+    ESP.restart();
+    return;
+  }
+  Serial.println("nvs_test_control outcome=rejected command=unknown_or_invalid");
+}
+
+static void pollNvsRuntimeTestSerial() {
+  while(Serial.available()>0) {
+    const char c=(char)Serial.read();
+    if(c=='\r') continue;
+    if(c=='\n') {
+      nvsTestCommand[nvsTestCommandLength]='\0';
+      if(nvsTestCommandLength) processNvsRuntimeTestCommand(nvsTestCommand);
+      nvsTestCommandLength=0;
+      continue;
+    }
+    if(nvsTestCommandLength+1<sizeof(nvsTestCommand)) {
+      nvsTestCommand[nvsTestCommandLength++]=c;
+    } else {
+      nvsTestCommandLength=0;
+      Serial.println("nvs_test_control outcome=rejected command=line_too_long");
+    }
+  }
+}
+#endif
 
 static int severity(AlarmState s) {
   switch(s) {
@@ -188,6 +307,37 @@ static bool eventMatches(const char *data,const char *boot,uint32_t eventSeq) {
   return parseEventIdentity(data,storedBoot,sizeof(storedBoot),storedSeq) &&
          storedSeq==eventSeq && strcmp(storedBoot,boot)==0;
 }
+#if NVS_RUNTIME_TEST
+static void dumpNvsRuntimeTestQueue() {
+  const uint8_t expectedCount=eventCount;
+  uint8_t records=0;
+  bool valid=true;
+  Serial.printf("nvs_test_queue_snapshot_begin device_id=%s boot_id=%s queue_count=%u head=%u capacity=%u\n",
+    DEVICE_ID,bootId.c_str(),(unsigned)expectedCount,(unsigned)eventHead,
+    (unsigned)eventCapacity);
+  for(uint8_t index=0;index<expectedCount;index++) {
+    const uint8_t slot=(eventHead+index)%eventCapacity;
+    String payload=eventStore.getString(eventKey(slot).c_str(),"");
+    char storedBoot[32]="-";
+    uint32_t storedSeq=0;
+    if(!payload.length() || !parseEventIdentity(payload.c_str(),storedBoot,
+                                                sizeof(storedBoot),storedSeq)) {
+      valid=false;
+      Serial.printf("nvs_test_queue_record device_id=%s index=%u slot=%u queue_count=%u outcome=invalid\n",
+        DEVICE_ID,(unsigned)index,(unsigned)slot,(unsigned)expectedCount);
+      continue;
+    }
+    Serial.printf("nvs_test_queue_record device_id=%s event_boot_id=%s event_seq=%lu index=%u slot=%u queue_count=%u payload=%s\n",
+      DEVICE_ID,storedBoot,(unsigned long)storedSeq,(unsigned)index,
+      (unsigned)slot,(unsigned)expectedCount,payload.c_str());
+    records++;
+  }
+  const bool complete=valid && records==expectedCount;
+  Serial.printf("nvs_test_queue_snapshot_end device_id=%s boot_id=%s queue_count=%u records=%u outcome=%s\n",
+    DEVICE_ID,bootId.c_str(),(unsigned)expectedCount,(unsigned)records,
+    complete ? "complete" : "invalid");
+}
+#endif
 static bool hasValidStoredEventSlot(uint8_t slot) {
   String key=eventKey(slot);
   if(!eventStore.isKey(key.c_str())) return false;
@@ -325,6 +475,10 @@ static void queueEvent(const String &data) {
   eventDiag("enqueue",pointersSaved ? "stored" : "stored_pointer_write_failed",
             eventBoot,eventSeq,identityKind,eventCount,
             identityValid ? "nvs_event_slot_written" : "identity_parse_failed");
+#if NVS_RUNTIME_TEST
+  if(pointersSaved && identityValid)
+    printNvsRuntimeTestEventRecord(DEVICE_ID,eventBoot,eventSeq,data.c_str());
+#endif
 }
 static void clearActiveEvent() {
   eventInFlight=0; eventSentAt=0; eventPublishPending=false; activeEventToken=0;
@@ -524,6 +678,10 @@ static void localAlarm(AlarmState s,uint32_t now) {
 static void mqttWorker(void *) {
   WiFi.mode(WIFI_STA);
   uint32_t lastWifiAttempt=0,lastConnectAttempt=0;
+#if MQTT_TLS
+  bool tlsClockSyncRequested=false;
+  uint32_t lastTlsClockLog=0;
+#endif
   PublishRequest pendingRequest{};
   bool haveRequest=false;
   PublishResult pendingResult{};
@@ -533,6 +691,14 @@ static void mqttWorker(void *) {
   for(;;) {
     uint32_t now=millis();
     bool wifiReady=WiFi.status()==WL_CONNECTED;
+#if MQTT_TLS
+    if(wifiReady && !tlsClockSyncRequested) {
+      configTime(0,0,"pool.ntp.org","time.cloudflare.com");
+      tlsClockSyncRequested=true;
+      Serial.println("TLS certificate clock synchronization requested");
+    }
+    bool tlsClockReady=time(nullptr)>=1735689600; // 2025-01-01 UTC; TLS validation remains enabled.
+#endif
     if(haveResult && xQueueSend(publishResultQueue,&pendingResult,0)==pdTRUE) haveResult=false;
     if(haveAck && xQueueSend(commitAckQueue,&pendingAck,0)==pdTRUE) haveAck=false;
 
@@ -544,6 +710,14 @@ static void mqttWorker(void *) {
       }
     } else if(!mqtt.connected()) {
       if(mqttEventGroup) xEventGroupClearBits(mqttEventGroup,MQTT_CONNECTED_BIT);
+#if MQTT_TLS
+      if(!tlsClockReady) {
+        if(now-lastTlsClockLog>=15000) {
+          lastTlsClockLog=now;
+          Serial.println("TLS MQTT waiting for a synchronized system clock");
+        }
+      } else
+#endif
       if(now-lastConnectAttempt>=3000) {
         lastConnectAttempt=now;
         String will=String("{\"device_id\":\"")+DEVICE_ID+"\",\"online\":false}";
@@ -555,7 +729,9 @@ static void mqttWorker(void *) {
           if(mqttEventGroup) xEventGroupSetBits(mqttEventGroup,MQTT_CONNECTED_BIT);
           Serial.printf("MQTT connected: %s:%d\n",MQTT_HOST,MQTT_PORT);
         } else {
+#if !NVS_RUNTIME_TEST
           Serial.println("MQTT connect failed: check gateway, address and credentials");
+#endif
         }
       }
     }
@@ -597,6 +773,9 @@ static void mqttWorker(void *) {
 static void readInputs() {
 #if SIMULATION
   int lpg=analogRead(LPG),co=analogRead(CO),t=analogRead(TEMP),h=analogRead(HUM),noise=analogRead(INTERFERENCE);
+#if NVS_RUNTIME_TEST
+  if(nvsTestLpgRaw>=0) lpg=nvsTestLpgRaw;
+#endif
   lpgTruth=100.0f*lpg/4095.0f;
   interferencePct=30.0f*(noise/4095.0f-0.5f);
   if(fabsf(interferencePct)<1.0f) interferencePct=0;
@@ -608,6 +787,12 @@ static void readInputs() {
   lpgSignal=constrain(lpgTruth+interferencePct+environmentBias,0.0f,100.0f);
   lpgValid=digitalRead(LPG_FAULT)==HIGH && lpg>=0 && lpg<=4095;
   coValid=digitalRead(CO_FAULT)==HIGH && co>=0 && co<=4095;
+#if NVS_RUNTIME_TEST
+  // Test-build-only fault injection follows the same invalid-sample path as a
+  // failed physical read. Production and Wokwi node targets use their inputs.
+  if(nvsTestLpgInvalid) lpgValid=false;
+  if(nvsTestCoInvalid) coValid=false;
+#endif
 #elif HARDWARE_N8R8 && N8R8_SENSOR_CONFIGURED
   const uint32_t sampledAtMs = millis();
   const bool environmentFresh =
@@ -708,6 +893,12 @@ static String payload(const char *kind,uint32_t now,const char *changedGas="NONE
 }
 void setup() {
   Serial.begin(115200);
+#if NVS_RUNTIME_TEST
+  if(nvsTestRtcMagic!=NVS_TEST_RTC_MAGIC) {
+    nvsTestRtcMagic=NVS_TEST_RTC_MAGIC;
+    nvsTestLpgRaw=-1;
+  }
+#endif
   pinMode(GREEN,OUTPUT); pinMode(AMBER,OUTPUT); pinMode(RED,OUTPUT); pinMode(BUZZER,OUTPUT);
 #if SIMULATION
   pinMode(LPG_FAULT,INPUT_PULLUP); pinMode(CO_FAULT,INPUT_PULLUP); pinMode(ACK,INPUT_PULLUP); pinMode(INSPECT,INPUT_PULLUP);
@@ -848,6 +1039,9 @@ void setup() {
 }
 void loop() {
   uint32_t now=millis();
+#if NVS_RUNTIME_TEST
+  pollNvsRuntimeTestSerial();
+#endif
 #if HARDWARE_N8R8 && N8R8_SENSOR_CONFIGURED
   pollHardwareSensors(now);
 #endif

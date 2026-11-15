@@ -41,54 +41,58 @@ def validate_scenarios(root: Path = ROOT) -> tuple[int, list[str]]:
             expected = (firmware_root / ".pio" / "build" / node / filename).resolve(strict=False)
             assert artifact == expected, f"{node}: configured {artifact_key} path must resolve to this node's PlatformIO output: {configured}"
         assert diagram["version"] == 1
-        scenario_path = sim / "scenarios" / f"{node}.yaml"
-        scenario = yaml.safe_load(scenario_path.read_text(encoding="utf-8"))
-        assert scenario["version"] == 1, f"{scenario_path}: unsupported scenario version"
-        assert isinstance(scenario["steps"], list) and scenario["steps"], f"{scenario_path}: no steps"
         parts = {part["id"] for part in diagram["parts"]}
         wires = {endpoint for wire in diagram["connections"] for endpoint in wire[:2]}
-        for index, step in enumerate(scenario["steps"], start=1):
-            assert isinstance(step, dict) and len(step) == 1, f"{scenario_path}: step {index} must have one action"
-            action, value = next(iter(step.items()))
-            if action == "set-control":
-                part_id = value["part-id"]
-                control = value["name"]
-                assert part_id in parts, f"{scenario_path}: missing part {part_id}"
-                assert control in SUPPORTED_CONTROLS.get(part_id, set()), (
-                    f"{scenario_path}: unsupported control {part_id}.{control}"
-                )
-                if control == "position":
-                    assert 0 <= float(value["value"]) <= 1, f"{scenario_path}: pot out of range"
-                assertions += 1
-            elif action == "expect-pin":
-                part_id = value["part-id"]
-                pin = str(value["name"])
-                assert part_id in parts, f"{scenario_path}: missing pin part {part_id}"
-                assert f"{part_id}:{pin}" in wires, f"{scenario_path}: pin {part_id}:{pin} is not in diagram wiring"
-                assert value["value"] in (0, 1), f"{scenario_path}: digital pin value must be 0 or 1"
-                assertions += 1
-            elif action == "wait-serial":
-                assert isinstance(value, str) and value.strip(), f"{scenario_path}: empty serial assertion"
-                if value.startswith(f"{node}:"):
-                    assert value.startswith(f"{node}: LPG "), (
-                        f"{scenario_path}: firmware prefixes transition lines with '{node}: LPG'; got {value!r}"
+        scenario_paths = sorted((sim / "scenarios").glob("*.yaml"))
+        assert scenario_paths, f"{node}: no scenario YAML files"
+        for scenario_path in scenario_paths:
+            scenario = yaml.safe_load(scenario_path.read_text(encoding="utf-8"))
+            assert scenario["version"] == 1, f"{scenario_path}: unsupported scenario version"
+            assert isinstance(scenario["steps"], list) and scenario["steps"], f"{scenario_path}: no steps"
+            for index, step in enumerate(scenario["steps"], start=1):
+                assert isinstance(step, dict) and len(step) == 1, f"{scenario_path}: step {index} must have one action"
+                action, value = next(iter(step.items()))
+                if action == "set-control":
+                    part_id = value["part-id"]
+                    control = value["name"]
+                    assert part_id in parts, f"{scenario_path}: missing part {part_id}"
+                    assert control in SUPPORTED_CONTROLS.get(part_id, set()), (
+                        f"{scenario_path}: unsupported control {part_id}.{control}"
                     )
-                    state = value.split()[2]
-                    assert state in VALID_STATES, f"{scenario_path}: unknown LPG serial state {state}"
-                elif value.startswith("CO "):
-                    state = value.split()[1]
-                    assert state in VALID_STATES, f"{scenario_path}: unknown CO serial state {state}"
+                    if control == "position":
+                        assert 0 <= float(value["value"]) <= 1, f"{scenario_path}: pot out of range"
+                    assertions += 1
+                elif action == "expect-pin":
+                    part_id = value["part-id"]
+                    pin = str(value["name"])
+                    assert part_id in parts, f"{scenario_path}: missing pin part {part_id}"
+                    assert f"{part_id}:{pin}" in wires, f"{scenario_path}: pin {part_id}:{pin} is not in diagram wiring"
+                    assert value["value"] in (0, 1), f"{scenario_path}: digital pin value must be 0 or 1"
+                    assertions += 1
+                elif action == "wait-serial":
+                    assert isinstance(value, str) and value.strip(), f"{scenario_path}: empty serial assertion"
+                    if value.startswith(f"{node}:"):
+                        assert value.startswith(f"{node}: LPG "), (
+                            f"{scenario_path}: firmware prefixes transition lines with '{node}: LPG'; got {value!r}"
+                        )
+                        state = value.split()[2]
+                        assert state in VALID_STATES, f"{scenario_path}: unknown LPG serial state {state}"
+                    elif value.startswith("CO "):
+                        state = value.split()[1]
+                        assert state in VALID_STATES, f"{scenario_path}: unknown CO serial state {state}"
+                    else:
+                        raise AssertionError(f"{scenario_path}: assertion is not present in transition line format: {value!r}")
+                    assertions += 1
+                elif action == "delay":
+                    assert isinstance(value, str) and value.endswith(("ms", "s")), f"{scenario_path}: delay needs units"
                 else:
-                    raise AssertionError(f"{scenario_path}: assertion is not present in transition line format: {value!r}")
-                assertions += 1
-            elif action == "delay":
-                assert isinstance(value, str) and value.endswith(("ms", "s")), f"{scenario_path}: delay needs units"
-            else:
-                raise AssertionError(f"{scenario_path}: unsupported action {action}")
-        assert "expect-pin" in scenario["steps"][0] or any("expect-pin" in s for s in scenario["steps"]), (
-            f"{scenario_path}: no GPIO assertion"
-        )
-        summaries.append(f"PASS static: {node} TOML output paths, diagram, YAML, {len(scenario['steps'])} steps")
+                    raise AssertionError(f"{scenario_path}: unsupported action {action}")
+            assert any("expect-pin" in step for step in scenario["steps"]), (
+                f"{scenario_path}: no GPIO assertion"
+            )
+            summaries.append(
+                f"PASS static: {node} {scenario_path.name} TOML output paths, diagram, YAML, {len(scenario['steps'])} steps"
+            )
     summaries.append(f"PASS static: {assertions} serial/GPIO/control assertions checked")
     summaries.append("SCOPE: static only; artifact existence is checked separately after a fresh build")
     return assertions, summaries

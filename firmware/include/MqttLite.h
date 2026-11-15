@@ -1,5 +1,12 @@
 #pragma once
+#ifndef MQTT_TLS
+#define MQTT_TLS 0
+#endif
+#if MQTT_TLS
+#include <WiFiClientSecure.h>
+#else
 #include <WiFiClient.h>
+#endif
 #include <stdint.h>
 class MqttLite {
  public:
@@ -12,7 +19,11 @@ class MqttLite {
   void loop();
   bool connected() { return client_.connected(); }
  private:
+#if MQTT_TLS
+  WiFiClientSecure client_;
+#else
   WiFiClient client_;
+#endif
   uint32_t lastActivity_=0;
   uint16_t nextId_=1,lastAck_=0;
   uint8_t rx_[256] = {};

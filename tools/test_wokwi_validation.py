@@ -29,7 +29,8 @@ class WokwiArtifactValidationTests(unittest.TestCase):
             (target / "scenarios").mkdir(parents=True)
             for name in ("diagram.json", "wokwi.toml"):
                 shutil.copy2(source / name, target / name)
-            shutil.copy2(source / "scenarios" / f"{node}.yaml", target / "scenarios" / f"{node}.yaml")
+            for scenario in (source / "scenarios").glob("*.yaml"):
+                shutil.copy2(scenario, target / "scenarios" / scenario.name)
 
     def _create_artifacts(self) -> None:
         build_root = self.project / "firmware" / ".pio" / "build"
@@ -49,6 +50,11 @@ class WokwiArtifactValidationTests(unittest.TestCase):
         self._create_artifacts()
         assertions, _ = validate_scenarios(self.project)
         self.assertGreater(assertions, 0)
+
+    def test_additional_fault_scenario_is_included_in_static_validation(self) -> None:
+        assertions, summaries = validate_scenarios(self.project)
+        self.assertGreater(assertions, 56)
+        self.assertTrue(any("sensor-faults.yaml" in line for line in summaries))
 
     def test_artifact_validation_fails_when_outputs_are_absent(self) -> None:
         with self.assertRaisesRegex(ArtifactValidationError, "artifact is missing"):

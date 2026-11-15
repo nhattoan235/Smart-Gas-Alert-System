@@ -3,3 +3,10 @@ dashboard/*.sqlite3
 dashboard/*.sqlite3-wal
 dashboard/*.sqlite3-shm
 **/__pycache__/
+**/.pytest_cache/
+/test-results/
+/tmp/
+/docs/agent-review/
+.env
+.env.*
+!.env.example

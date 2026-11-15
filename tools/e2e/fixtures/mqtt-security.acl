@@ -1,0 +1,13 @@
+# Example least-privilege policy for the isolated security test broker.
+# Runtime tests generate disposable usernames/passwords; no credentials here.
+user node1-test
+topic write home/security-test/device/node1/event
+topic write home/security-test/device/node1/telemetry
+topic write home/security-test/device/node1/availability
+topic read home/security-test/device/node1/ack
+
+user gateway-test
+topic read home/security-test/device/+/event
+topic read home/security-test/device/+/telemetry
+topic read home/security-test/device/+/availability
+topic write home/security-test/device/+/ack

@@ -4,8 +4,10 @@
 //   ./detector_recovery_test
 
 #include <cassert>
+#include <algorithm>
 #include <cstdio>
 #include <stdint.h>
+#include <vector>
 
 #include "../include/Detector.h"
 
@@ -280,6 +282,193 @@ static void testAdversarialNegativeInterferenceCanMaskRelativeRise() {
   assert(masked.state() == AlarmState::SAFE);
 }
 
+struct InterferenceEpisodeResult {
+  bool watchPlusDetected;
+  bool alarmActiveDetected;
+  bool fixedThresholdDetected;
+  uint32_t watchPlusLatencyMs;
+  uint32_t alarmActiveLatencyMs;
+  uint32_t fixedThresholdLatencyMs;
+  float finalRise;
+  AlarmState finalState;
+};
+
+static bool isAlarmPositive(AlarmState state) {
+  return state == AlarmState::WATCH || state == AlarmState::WARNING ||
+         state == AlarmState::DANGER;
+}
+
+static double medianLatencyMs(const std::vector<uint32_t> &values) {
+  assert(!values.empty());
+  const size_t middle = values.size() / 2;
+  if (values.size() % 2 != 0) return values[middle];
+  return (static_cast<double>(values[middle - 1]) + values[middle]) / 2.0;
+}
+
+static InterferenceEpisodeResult runSyntheticInterferenceEpisode(
+    float hazardSignal, float negativeInterference, float environmentBias) {
+  Detector detector;
+  for (uint32_t now = 0; now <= 6000; now += 100)
+    detector.update(5.0f, true, now);
+  assert(detector.state() == AlarmState::SAFE);
+
+  const uint32_t hazardStartMs = 6100;
+  const float observed = hazardSignal + negativeInterference + environmentBias;
+  InterferenceEpisodeResult result = {false, false, false, 0, 0, 0, 0.0f, AlarmState::WARMUP};
+  bool fixedThresholdTimer = false;
+  uint32_t fixedThresholdSinceMs = 0;
+  for (uint32_t now = hazardStartMs; now <= hazardStartMs + 30000; now += 100) {
+    const AlarmState state = detector.update(observed, true, now);
+    if (detector.filtered() >= 28.0f) {
+      if (!fixedThresholdTimer) {
+        fixedThresholdTimer = true;
+        fixedThresholdSinceMs = now;
+      }
+      if (!result.fixedThresholdDetected &&
+          static_cast<uint32_t>(now - fixedThresholdSinceMs) >= 5000) {
+        result.fixedThresholdDetected = true;
+        result.fixedThresholdLatencyMs = now - hazardStartMs;
+      }
+    } else {
+      fixedThresholdTimer = false;
+    }
+    if (!result.watchPlusDetected && isAlarmPositive(state)) {
+      result.watchPlusDetected = true;
+      result.watchPlusLatencyMs = now - hazardStartMs;
+    }
+    if (!result.alarmActiveDetected &&
+        (state == AlarmState::WARNING || state == AlarmState::DANGER)) {
+      result.alarmActiveDetected = true;
+      result.alarmActiveLatencyMs = now - hazardStartMs;
+    }
+    result.finalRise = detector.rise();
+    result.finalState = state;
+  }
+  return result;
+}
+
+static void testSyntheticNegativeInterferenceFNRAndLatencyAgainstFixedThreshold() {
+  // Synthetic detector-input cases only. The comparator uses the same
+  // Detector::filtered() output and requires >=28 for 5 seconds.
+  // WATCH+ means WATCH/WARNING/DANGER; alarm-active means WARNING/DANGER.
+  // The three masked cases use interference/bias magnitudes available in the
+  // Wokwi signal model; they are not calibrated MQ sensor cross-sensitivity.
+  struct Case { const char *name; float hazard; float interference; float bias; };
+  const Case cases[] = {
+      {"unmasked", 35.0f, 0.0f, 0.0f},
+      {"partial_negative", 36.0f, -10.0f, 0.0f},
+      {"warning_delta_boundary", 35.0f, -10.0f, 0.0f},
+      {"strong_negative", 28.0f, -15.0f, 0.0f},
+      {"fully_cancelled", 28.0f, -15.0f, -8.0f},
+  };
+
+  uint32_t totalWatchFn = 0, totalAlarmFn = 0, totalFixedFn = 0;
+  uint32_t totalMaskedWatchFn = 0, totalMaskedAlarmFn = 0, totalMaskedFixedFn = 0;
+  std::vector<uint32_t> totalWatchDelays, totalAlarmDelays, totalFixedDelays;
+  std::vector<uint32_t> totalMaskedWatchDelays, totalMaskedAlarmDelays;
+  for (const char *gas : {"LPG", "CO"}) {
+    uint32_t watchFn = 0, alarmFn = 0, fixedFn = 0;
+    std::vector<uint32_t> watchDelays, alarmDelays, fixedDelays;
+    uint32_t maskedWatchFn = 0, maskedAlarmFn = 0, maskedFixedFn = 0;
+    std::vector<uint32_t> maskedWatchDelays, maskedAlarmDelays, maskedFixedDelays;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+      const InterferenceEpisodeResult result = runSyntheticInterferenceEpisode(
+          cases[i].hazard, cases[i].interference, cases[i].bias);
+      if (!result.watchPlusDetected) watchFn++;
+      else watchDelays.push_back(result.watchPlusLatencyMs);
+      if (!result.alarmActiveDetected) alarmFn++;
+      else alarmDelays.push_back(result.alarmActiveLatencyMs);
+      if (!result.fixedThresholdDetected) fixedFn++;
+      else fixedDelays.push_back(result.fixedThresholdLatencyMs);
+      if (i != 0) {
+        if (!result.watchPlusDetected) maskedWatchFn++;
+        else maskedWatchDelays.push_back(result.watchPlusLatencyMs);
+        if (!result.alarmActiveDetected) maskedAlarmFn++;
+        else maskedAlarmDelays.push_back(result.alarmActiveLatencyMs);
+        if (!result.fixedThresholdDetected) maskedFixedFn++;
+        else maskedFixedDelays.push_back(result.fixedThresholdLatencyMs);
+      }
+      std::printf("negative_interference_episode gas=%s case=%s observed_pct=%.1f final_state=%s final_rise_pct=%.7f watch_plus=%s watch_plus_latency_ms=%u alarm_active=%s alarm_active_latency_ms=%u fixed_28_dwell5s=%s fixed_latency_ms=%u source=synthetic fully_cancelled_limit=%s\n",
+          gas, cases[i].name,
+          cases[i].hazard + cases[i].interference + cases[i].bias,
+          stateName(result.finalState), result.finalRise,
+          result.watchPlusDetected ? "DETECTED" : "MISSED",
+          static_cast<unsigned>(result.watchPlusLatencyMs),
+          result.alarmActiveDetected ? "DETECTED" : "MISSED",
+          static_cast<unsigned>(result.alarmActiveLatencyMs),
+          result.fixedThresholdDetected ? "DETECTED" : "MISSED",
+          static_cast<unsigned>(result.fixedThresholdLatencyMs),
+          i == 4 ? "UNIDENTIFIABLE_EXPECTED_FALSE_NEGATIVE" : "not_applicable");
+      std::printf("negative_interference_label gas=%s case=%s truth_hazard=true onset_ms=6100 evaluation_window_ms=30000\n",
+          gas, cases[i].name);
+      if (i == 2) {
+        // Regression requirement: the declared delta>=20 warning boundary
+        // must remain reachable after Median/EMA filtering.
+        assert(result.alarmActiveDetected);
+      }
+    }
+    std::fflush(stdout);
+    assert(watchFn == 1 && alarmFn == 2 && fixedFn == 4);
+    assert(maskedWatchFn == 1 && maskedAlarmFn == 2 && maskedFixedFn == 4);
+    assert(watchFn < fixedFn && alarmFn < fixedFn);
+    std::sort(watchDelays.begin(), watchDelays.end());
+    std::sort(alarmDelays.begin(), alarmDelays.end());
+    std::sort(maskedWatchDelays.begin(), maskedWatchDelays.end());
+    std::sort(maskedAlarmDelays.begin(), maskedAlarmDelays.end());
+    const double watchP50 = medianLatencyMs(watchDelays);
+    const double alarmP50 = medianLatencyMs(alarmDelays);
+    const double maskedWatchP50 = medianLatencyMs(maskedWatchDelays);
+    const double maskedAlarmP50 = medianLatencyMs(maskedAlarmDelays);
+    const double fixedP50 = medianLatencyMs(fixedDelays);
+    std::printf("negative_interference_metrics gas=%s episodes=5 watch_plus_fn=%u watch_plus_fnr=%.6f alarm_active_fn=%u alarm_active_fnr=%.6f fixed_filtered_28_dwell5s_fn=%u fixed_filtered_28_dwell5s_fnr=%.6f watch_plus_p50_latency_ms=%.1f alarm_active_p50_latency_ms=%.1f fixed_filtered_28_dwell5s_latency_samples=%u fixed_filtered_28_dwell5s_p50_latency_ms=%.1f masked_episodes=4 masked_watch_plus_fn=%u masked_watch_plus_fnr=%.6f masked_alarm_active_fn=%u masked_alarm_active_fnr=%.6f masked_fixed_filtered_28_dwell5s_fn=%u masked_fixed_filtered_28_dwell5s_fnr=%.6f masked_watch_plus_p50_latency_ms=%.1f masked_alarm_active_p50_latency_ms=%.1f masked_fixed_latency_samples=%u scope=synthetic_detector_input\n",
+        gas, static_cast<unsigned>(watchFn), watchFn / 5.0,
+        static_cast<unsigned>(alarmFn), alarmFn / 5.0,
+        static_cast<unsigned>(fixedFn), fixedFn / 5.0,
+        watchP50, alarmP50, static_cast<unsigned>(fixedDelays.size()), fixedP50,
+        static_cast<unsigned>(maskedWatchFn), maskedWatchFn / 4.0,
+        static_cast<unsigned>(maskedAlarmFn), maskedAlarmFn / 4.0,
+        static_cast<unsigned>(maskedFixedFn), maskedFixedFn / 4.0,
+        maskedWatchP50, maskedAlarmP50,
+        static_cast<unsigned>(maskedFixedDelays.size()));
+
+    const InterferenceEpisodeResult belowBoundary =
+        runSyntheticInterferenceEpisode(24.99f, 0.0f, 0.0f);
+    assert(belowBoundary.watchPlusDetected);
+    assert(!belowBoundary.alarmActiveDetected);
+    std::printf("negative_interference_boundary_guard gas=%s observed_pct=24.99 watch_plus=%s alarm_active=%s source=synthetic assertion=below_delta_20_does_not_raise_alarm\n",
+        gas, belowBoundary.watchPlusDetected ? "DETECTED" : "MISSED",
+        belowBoundary.alarmActiveDetected ? "DETECTED" : "MISSED");
+
+    totalWatchFn += watchFn;
+    totalAlarmFn += alarmFn;
+    totalFixedFn += fixedFn;
+    totalMaskedWatchFn += maskedWatchFn;
+    totalMaskedAlarmFn += maskedAlarmFn;
+    totalMaskedFixedFn += maskedFixedFn;
+    totalWatchDelays.insert(totalWatchDelays.end(), watchDelays.begin(), watchDelays.end());
+    totalAlarmDelays.insert(totalAlarmDelays.end(), alarmDelays.begin(), alarmDelays.end());
+    totalFixedDelays.insert(totalFixedDelays.end(), fixedDelays.begin(), fixedDelays.end());
+    totalMaskedWatchDelays.insert(totalMaskedWatchDelays.end(), maskedWatchDelays.begin(), maskedWatchDelays.end());
+    totalMaskedAlarmDelays.insert(totalMaskedAlarmDelays.end(), maskedAlarmDelays.begin(), maskedAlarmDelays.end());
+  }
+  assert(totalWatchFn == 2 && totalAlarmFn == 4 && totalFixedFn == 8);
+  assert(totalMaskedWatchFn == 2 && totalMaskedAlarmFn == 4 && totalMaskedFixedFn == 8);
+  std::sort(totalWatchDelays.begin(), totalWatchDelays.end());
+  std::sort(totalAlarmDelays.begin(), totalAlarmDelays.end());
+  std::sort(totalFixedDelays.begin(), totalFixedDelays.end());
+  std::sort(totalMaskedWatchDelays.begin(), totalMaskedWatchDelays.end());
+  std::sort(totalMaskedAlarmDelays.begin(), totalMaskedAlarmDelays.end());
+  std::printf("negative_interference_metrics gas=ALL episodes=10 watch_plus_fn=%u watch_plus_fnr=%.6f alarm_active_fn=%u alarm_active_fnr=%.6f fixed_filtered_28_dwell5s_fn=%u fixed_filtered_28_dwell5s_fnr=%.6f watch_plus_p50_latency_ms=%.1f alarm_active_p50_latency_ms=%.1f fixed_filtered_28_dwell5s_p50_latency_ms=%.1f masked_episodes=8 masked_watch_plus_fn=%u masked_watch_plus_fnr=%.6f masked_alarm_active_fn=%u masked_alarm_active_fnr=%.6f masked_fixed_filtered_28_dwell5s_fn=%u masked_fixed_filtered_28_dwell5s_fnr=%.6f masked_watch_plus_p50_latency_ms=%.1f masked_alarm_active_p50_latency_ms=%.1f scope=synthetic_detector_input\n",
+      static_cast<unsigned>(totalWatchFn), totalWatchFn / 10.0,
+      static_cast<unsigned>(totalAlarmFn), totalAlarmFn / 10.0,
+      static_cast<unsigned>(totalFixedFn), totalFixedFn / 10.0,
+      medianLatencyMs(totalWatchDelays), medianLatencyMs(totalAlarmDelays), medianLatencyMs(totalFixedDelays),
+      static_cast<unsigned>(totalMaskedWatchFn), totalMaskedWatchFn / 8.0,
+      static_cast<unsigned>(totalMaskedAlarmFn), totalMaskedAlarmFn / 8.0,
+      static_cast<unsigned>(totalMaskedFixedFn), totalMaskedFixedFn / 8.0,
+      medianLatencyMs(totalMaskedWatchDelays), medianLatencyMs(totalMaskedAlarmDelays));
+}
+
 int main() {
   testBelowWatchRecoveryEntersWatch();
   testWatchBandRecoveryEntersWatch();
@@ -300,6 +489,7 @@ int main() {
   testClearTimerStartsAtZero();
   testScalarInputCannotIdentifyPhysicalFailureCause();
   testAdversarialNegativeInterferenceCanMaskRelativeRise();
+  testSyntheticNegativeInterferenceFNRAndLatencyAgainstFixedThreshold();
   std::puts("Detector recovery regression cases passed.");
   return 0;
 }

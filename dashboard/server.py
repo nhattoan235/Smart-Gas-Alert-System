@@ -8,6 +8,7 @@ import ipaddress
 import os
 import re
 import socket
+import ssl
 import sqlite3
 import struct
 import threading
@@ -22,10 +23,11 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("GAS_DB", str(ROOT / "gas_sentinel.sqlite3")))
-MQTT_HOST = os.environ.get("MQTT_HOST", "192.168.22.128")
+MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "iotlab")
 MQTT_PASSWORD = os.environ.get("GAS_MQTT_PASSWORD", os.environ.get("MQTT_PASSWORD", ""))
+MQTT_TLS_CA_FILE = os.environ.get("GAS_MQTT_CA_CERT_FILE", "").strip()
 HOME_ID = os.environ.get("HOME_ID", "demo-home")
 WEB_HOST = os.environ.get("WEB_HOST", "127.0.0.1")
 WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))
@@ -807,6 +809,27 @@ def publish_committed_event_ack(sock: socket.socket, topic: str, payload: bytes,
     return True
 
 
+def open_mqtt_socket() -> socket.socket:
+    """Open the local-demo TCP connection or a CA-verified TLS connection.
+
+    Setting GAS_MQTT_CA_CERT_FILE opts the gateway into TLS. In that mode the
+    configured CA, certificate chain, and MQTT_HOST name must all validate;
+    failure closes the raw socket and never retries the same connection as
+    plaintext. Leaving the variable unset preserves the local demo behavior.
+    """
+    raw = socket.create_connection((MQTT_HOST, MQTT_PORT), timeout=5)
+    if not MQTT_TLS_CA_FILE:
+        return raw
+    try:
+        context = ssl.create_default_context(cafile=MQTT_TLS_CA_FILE)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
+        return context.wrap_socket(raw, server_hostname=MQTT_HOST)
+    except Exception:
+        raw.close()
+        raise
+
+
 def snapshot() -> dict:
     now = time.time()
     with db() as con:
@@ -904,7 +927,7 @@ def mqtt_worker() -> None:
     global MQTT_CONNECTED
     while True:
         try:
-            with socket.create_connection((MQTT_HOST, MQTT_PORT), timeout=5) as sock:
+            with open_mqtt_socket() as sock:
                 sock.settimeout(2)
                 client_id = f"gas-dashboard-{os.getpid()}"
                 flags = 2 | (128 if MQTT_USER else 0) | (64 if MQTT_PASSWORD else 0)
