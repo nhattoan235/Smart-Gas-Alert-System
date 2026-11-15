@@ -2,6 +2,8 @@
 
 Mỗi bo ESP32-S3 đo **cả LPG và CO**, nhiệt độ và độ ẩm; tự cảnh báo bằng LED/còi. Ba bản sao của cùng một mạch đặt ở ba vị trí minh họa: gần bình/van (`node1`), dọc tuyến ống (`node2`), khu bếp (`node3`). Mọi bo gửi về Mosquitto Ubuntu và cùng một dashboard. [Thiết kế](docs/design.md) · [Phần cứng](docs/hardware.md) · [Kịch bản thử](docs/scenarios.md).
 
+Chạy toàn bộ kiểm thử từ máy Windows mới: [README_FULL_TESTS.md](README_FULL_TESTS.md).
+
 ## Chạy phiên bản mới
 
 **Dừng các phiên Wokwi cũ** có tên `cylinder`, `line`, `co`. Dashboard đang mở cần **dừng bằng Ctrl+C rồi khởi động lại** để nạp cấu hình ba bo mới. SQLite cũ không bị xóa; trang mới chỉ lấy dữ liệu `node1`–`node3`.
