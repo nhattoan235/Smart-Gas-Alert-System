@@ -18,7 +18,9 @@ class MqttLite {
   uint8_t rx_[256] = {};
   size_t rxLen_=0;
   char ackTopic_[96] = {};
-  char ackBoot_[32] = {};
-  uint32_t ackSeq_=0;
+  static constexpr uint8_t COMMIT_ACK_CAPACITY=8;
+  char ackBoot_[COMMIT_ACK_CAPACITY][32] = {};
+  uint32_t ackSeq_[COMMIT_ACK_CAPACITY] = {};
+  uint8_t ackHead_=0,ackCount_=0;
   bool writePacket(uint8_t header, const uint8_t *body, size_t length);
 };

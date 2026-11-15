@@ -21,7 +21,7 @@ const recordedActions = {
   INSPECTION_CONFIRMED: 'Đã nhấn INSPECTED tại bo'
 };
 const abnormal = new Set(['WATCH', 'WARNING', 'DANGER', 'FAULT', 'OFFLINE']);
-let model = { snapshot: null, history: [], events: [], incidents: [], layout: null, evaluation: [] };
+let model = { snapshot: null, history: [], events: [], incidents: [], layout: null, evaluation: [], syncStatus: null, notificationData: null };
 let filterAbnormal = false;
 
 function escapeHtml(value) {
@@ -245,6 +245,46 @@ function renderIncidents() {
     return `<tr class="${open && escalated ? 'log-row-danger' : ''}"><td>${stamp(new Date(item.opened_at * 1000))}</td><td>${escapeHtml(names[item.device_id] ?? item.device_id)} · ${escapeHtml(item.gas.toUpperCase())}</td><td>${badge(item.state)}</td><td>${open ? acknowledged ? 'Đã xác nhận trên web' : escalated ? 'Quá hạn xác nhận — cần xử lý' : 'Chờ xác nhận' : 'Đã kết thúc'}</td><td>${open && !acknowledged ? `<button type="button" class="btn btn-sm btn-outline-primary" data-ack-id="${Number(item.id)}">Xác nhận đã xem</button>` : '—'}</td></tr>`;
   }).join('') : '<tr><td colspan="5" class="text-center text-secondary py-4">Chưa có sự cố cần xác nhận.</td></tr>';
 }
+function renderIntegrationStatus() {
+  const count = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : '-';
+  const sync = model.syncStatus;
+  $('syncPending').textContent = count(sync?.pending);
+  $('syncLastSuccess').textContent = typeof sync?.last_success_at === 'number'
+    ? stamp(sync.last_success_at * 1000) : 'Chưa có lần đồng bộ thành công';
+  $('syncDedupeHorizon').textContent = Number.isSafeInteger(sync?.dedupe_horizon_days)
+    ? `Biên nhận chống trùng được giữ ${sync.dedupe_horizon_days} ngày sau khi lịch sử nguồn được dọn.`
+    : 'Chưa có thông tin thời hạn lưu biên nhận.';
+  $('syncStateText').textContent = !sync
+    ? location.protocol === 'file:' ? 'Mở trang máy chủ cục bộ để xem trạng thái đồng bộ.' : 'Không tải được trạng thái đồng bộ.'
+    : sync.configured !== true
+      ? 'Đồng bộ đi chưa được bật. Cấu hình máy chủ đích để bật tính năng này.'
+      : sync.last_error
+        ? 'Lần đồng bộ gần nhất lỗi hoặc chỉ được xác nhận một phần; bản ghi còn lại sẽ được thử lại.'
+        : sync.pending > 0 ? 'Đang chờ máy chủ xác nhận các bản ghi.' : 'Không có bản ghi đang chờ máy chủ xác nhận.';
+
+  const notification = model.notificationData?.status;
+  const logs = Array.isArray(model.notificationData?.log) ? model.notificationData.log.slice(0, 5) : [];
+  const simulated = notification?.provider === 'mock' && notification.simulated === true;
+  $('notificationDisclosure').textContent = simulated
+    ? 'Chỉ ghi vào nhật ký giả lập; không gửi tin nhắn ra ngoài.'
+    : 'Thông báo đang tắt; không gửi tin nhắn ra ngoài.';
+  $('notificationStateText').textContent = !notification
+    ? location.protocol === 'file:' ? 'Mở trang máy chủ cục bộ để xem trạng thái thông báo.' : 'Không tải được trạng thái thông báo.'
+    : simulated
+      ? `Bộ giả lập · ${count(notification.configured_recipients)} người nhận đã cấu hình · chỉ ghi nhận mô phỏng.`
+      : 'Chưa bật bộ gửi thông báo.';
+  $('notifyPending').textContent = count(notification?.pending);
+  $('notifySimulated').textContent = count(notification?.simulated_deliveries);
+  $('notifyFailures').textContent = count(notification?.failed_or_dead);
+  $('notifyExpiry').textContent = Number.isSafeInteger(notification?.acknowledgement_expiry_s)
+    ? `${notification.acknowledgement_expiry_s} giây` : '-';
+  $('notificationRows').innerHTML = logs.length ? logs.map(row => {
+    const result = row.status === 'simulated' ? 'Đã ghi nhận (giả lập)' : row.status === 'failed' ? 'Thất bại; đã ghi nhật ký thử lại' : 'Đã ghi nhật ký';
+    const time = typeof row.attempted_at === 'number' ? stamp(row.attempted_at * 1000) : '-';
+    return `<tr><td class="log-time">${escapeHtml(time)}</td><td>${escapeHtml(result)}</td></tr>`;
+  }).join('') : '<tr><td colspan="2" class="text-center text-secondary py-3">Chưa có lần thử thông báo nào.</td></tr>';
+}
+
 function renderLayout() {
   const layout = model.layout;
   const leak = layout?.leak_candidates?.[$('leakSelect').value || 'valve'];
@@ -261,7 +301,13 @@ function renderEvaluation() {
   const percent = value => value == null ? '—' : `${Math.round(value * 100)}%`;
   $('evaluationRows').innerHTML = model.evaluation?.length ? model.evaluation.map(row => `<tr><td><strong>${escapeHtml(names[row.device_id] ?? row.device_id)} · ${escapeHtml(row.gas)}</strong></td><td>${row.samples}</td><td>${percent(row.algorithm.precision)}</td><td>${percent(row.algorithm.recall)}</td><td>${percent(row.fixed.precision)}</td><td>${percent(row.fixed.recall)}</td><td><strong>${row.algorithm.fp} / ${row.algorithm.fn}</strong></td><td>${row.episodes ? `${row.episodes.detected_episodes}/${row.episodes.episodes} · ${row.episodes.mean_delay_s == null ? '—' : n1(row.episodes.mean_delay_s) + ' s'}` : '—'}</td></tr>`).join('') : '<tr><td colspan="8" class="text-center text-secondary py-4">Chưa có mẫu Wokwi được gắn nhãn.</td></tr>';
 }
-function renderAll() { renderOverview(); renderZones(); renderCharts(); renderEvents(); renderIncidents(); renderLayout(); renderEvaluation(); }
+function renderEvaluationInvalidSummary() {
+  const rows = (model.evaluation ?? []).filter(row => Number.isSafeInteger(row.excluded_invalid_samples) && row.excluded_invalid_samples > 0);
+  if (!rows.length) return;
+  const details = rows.map(row => `${escapeHtml(names[row.device_id] ?? row.device_id)} · ${escapeHtml(row.gas)}: ${row.excluded_invalid_samples}`);
+  $('evaluationRows').innerHTML += `<tr class="evaluation-invalid-summary"><td colspan="8" class="text-secondary small">Mẫu không hợp lệ đã loại khỏi phép tính · ${details.join(' · ')}</td></tr>`;
+}
+function renderAll() { renderOverview(); renderZones(); renderCharts(); renderEvents(); renderIncidents(); renderIntegrationStatus(); renderLayout(); renderEvaluation(); renderEvaluationInvalidSummary(); }
 
 async function fetchJson(url) {
   const response = await fetch(url, { cache: 'no-store' });
@@ -269,27 +315,62 @@ async function fetchJson(url) {
   return response.json();
 }
 async function refreshLive() {
+  let snapshot;
   try {
-    const selected = $('deviceSelect').value;
-    const [snapshot, events, history, incidents, layout, evaluation] = await Promise.all([
-      fetchJson('api/snapshot'), fetchJson('api/events'), fetchJson(`api/history?device=${encodeURIComponent(selected)}`), fetchJson('api/incidents'), fetchJson('api/layout'), fetchJson('api/evaluation')
-    ]);
-    model.snapshot = snapshot;
-    model.events = events;
-    model.incidents = incidents;
-    model.layout = layout;
-    model.evaluation = evaluation;
-    model.history[selected] = history;
-    renderAll();
-    $('modeBadge').textContent = snapshot.broker?.connected === true
+    snapshot = await fetchJson('api/snapshot');
+  } catch (error) {
+    model.events = [];
+    model.incidents = [];
+    model.layout = null;
+    model.evaluation = [];
+    model.syncStatus = null;
+    model.notificationData = null;
+    for (const rows of Object.values(model.history ?? {})) rows.length = 0;
+    if (model.snapshot?.nodes) {
+      for (const node of model.snapshot.nodes) {
+        node.online = false;
+        node.age_s = null;
+        node.state = 'OFFLINE';
+        node.latest = null;
+      }
+      renderAll();
+    }
+    $('modeBadge').textContent = 'Mất kết nối web';
+    $('overall').textContent = 'Không thể cập nhật';
+    $('summaryDetail').textContent = 'Kiểm tra dashboard/server.py và đường mạng đến trình duyệt.';
+    return;
+  }
+
+  const selected = $('deviceSelect').value;
+  model.snapshot = snapshot;
+  const secondary = [
+    { label: 'sync status', url: 'api/sync-status', apply: value => { model.syncStatus = value; }, clear: () => { model.syncStatus = null; } },
+    { label: 'notification status', url: 'api/notifications', apply: value => { model.notificationData = value; }, clear: () => { model.notificationData = null; } },
+    { label: 'nhật ký sự kiện', url: 'api/events', apply: value => { model.events = value; }, clear: () => { model.events = []; } },
+    { label: 'lịch sử biểu đồ', url: `api/history?device=${encodeURIComponent(selected)}`, apply: value => { model.history[selected] = value; }, clear: () => { model.history[selected] = []; } },
+    { label: 'danh sách sự cố', url: 'api/incidents', apply: value => { model.incidents = value; }, clear: () => { model.incidents = []; } },
+    { label: 'sơ đồ vị trí', url: 'api/layout', apply: value => { model.layout = value; }, clear: () => { model.layout = null; } },
+    { label: 'đánh giá', url: 'api/evaluation', apply: value => { model.evaluation = value; }, clear: () => { model.evaluation = []; } }
+  ];
+  const results = await Promise.allSettled(secondary.map(item => fetchJson(item.url)));
+  const failed = [];
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled') secondary[index].apply(result.value);
+    else {
+      secondary[index].clear();
+      failed.push(secondary[index].label);
+    }
+  });
+  renderAll();
+  $('modeBadge').textContent = failed.length
+    ? 'Dữ liệu thiết bị mới · lỗi tải dữ liệu phụ'
+    : snapshot.broker?.connected === true
       ? 'MQTT đã kết nối · dữ liệu trực tiếp'
       : snapshot.broker?.connected === false
         ? 'Máy chủ chạy · MQTT chưa kết nối'
         : 'Dữ liệu từ server cục bộ';
-  } catch (error) {
-    $('modeBadge').textContent = 'Mất kết nối web';
-    $('overall').textContent = 'Không thể cập nhật';
-    $('summaryDetail').textContent = 'Kiểm tra dashboard/server.py và đường mạng đến trình duyệt.';
+  if (failed.length) {
+    $('summaryDetail').textContent += ` Không tải được: ${failed.join(', ')}.`;
   }
 }
 $('incidentRows').addEventListener('click', async event => {

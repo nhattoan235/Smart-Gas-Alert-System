@@ -6,14 +6,17 @@ from pathlib import Path
 
 Import("env")
 
-generated = Path(env.subst("$BUILD_DIR")) / "generated"
-generated.mkdir(parents=True, exist_ok=True)
-header = generated / "MqttCredentials.h"
 password = os.environ.get("GAS_MQTT_PASSWORD", "")
-if not password:
+hardware_target = env.get("PIOENV", "") == "n8r8_hardware"
+if not password and not hardware_target:
     raise RuntimeError(
         "GAS_MQTT_PASSWORD is empty. Set it in the same PowerShell session before running pio run."
     )
+if not password and hardware_target:
+    print("Building the unconfigured N8R8 target with an empty MQTT password; its host and Wi-Fi SSID are placeholders.")
+generated = Path(env.subst("$BUILD_DIR")) / "generated"
+generated.mkdir(parents=True, exist_ok=True)
+header = generated / "MqttCredentials.h"
 content = "#pragma once\n#define MQTT_PASSWORD " + json.dumps(
     password
 ) + "\n"

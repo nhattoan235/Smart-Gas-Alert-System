@@ -1,0 +1,12 @@
+source_type,run_id,scenario,device_id,gas,sample_time_ms,truth_hazard,truth_episode_id,hazard_start_ms,first_alarm_ms,state,valid
+synthetic,fixture-only,metric-smoke-only,node1,LPG,0,false,,,,SAFE,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,100,false,,,,WARNING,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,200,true,episode-1,200,400,SAFE,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,300,true,episode-1,200,400,SAFE,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,400,true,episode-1,200,400,WATCH,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,500,false,,,,SAFE,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,600,true,episode-2,600,,SAFE,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,700,true,episode-2,600,,SAFE,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,800,false,,,,FAULT,true
+synthetic,fixture-only,metric-smoke-only,node1,LPG,900,false,,,,SAFE,false
+synthetic,fixture-only,metric-smoke-only,node1,LPG,,false,,,,SAFE,false

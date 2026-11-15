@@ -6,6 +6,29 @@ enum class AlarmState : uint8_t { WARMUP, SAFE, WATCH, WARNING, DANGER, FAULT };
 
 const char *stateName(AlarmState state);
 
+struct DetectorTimer {
+  uint32_t startedAt = 0;
+  bool active = false;
+
+  void start(uint32_t nowMs) {
+    if (!active) {
+      startedAt = nowMs;
+      active = true;
+    }
+  }
+  void restart(uint32_t nowMs) {
+    startedAt = nowMs;
+    active = true;
+  }
+  void reset() {
+    startedAt = 0;
+    active = false;
+  }
+  bool elapsed(uint32_t nowMs, uint32_t durationMs) const {
+    return active && (uint32_t)(nowMs - startedAt) >= durationMs;
+  }
+};
+
 // These relative-signal values are demonstration parameters, not gas-safety limits.
 class Detector {
  public:
@@ -17,25 +40,36 @@ class Detector {
   bool ready() const { return samples_ >= 5; }
   bool inspectionRequired() const { return inspectionRequired_; }
   bool canConfirmInspection(uint32_t nowMs) const {
-    return state_ == AlarmState::WATCH && inspectionRequired_ && clearSince_ && nowMs - clearSince_ >= 10000;
+    return state_ == AlarmState::WATCH && inspectionRequired_ && clearSince_.elapsed(nowMs, 10000);
   }
   void markInspected(uint32_t nowMs) { if (canConfirmInspection(nowMs)) inspected_ = true; }
+  bool takeTransitionDwellMs(uint32_t &dwellMs) {
+    if (!transitionDwellPending_) return false;
+    dwellMs = lastTransitionDwellMs_;
+    transitionDwellPending_ = false;
+    return true;
+  }
 
  private:
+  void recordUpwardTransition(AlarmState previousState, uint32_t nowMs);
+
   float recent_[5] = {};
   uint8_t index_ = 0;
   uint8_t samples_ = 0;
   float filtered_ = 0;
   float baseline_ = 0;
   AlarmState state_ = AlarmState::WARMUP;
-  uint32_t watchSince_ = 0;
-  uint32_t warningSince_ = 0;
-  uint32_t dangerSince_ = 0;
-  uint32_t slowRiseSince_ = 0;
-  uint32_t clearSince_ = 0;
-  uint32_t recoverySince_ = 0;
-  uint32_t invalidSince_ = 0;
-  uint32_t validSince_ = 0;
+  DetectorTimer watchSince_;
+  DetectorTimer warningSince_;
+  DetectorTimer dangerSince_;
+  DetectorTimer slowRiseSince_;
+  DetectorTimer clearSince_;
+  DetectorTimer recoverySince_;
+  DetectorTimer invalidSince_;
+  DetectorTimer validSince_;
   bool inspectionRequired_ = false;
   bool inspected_ = false;
+  bool reseedFiltered_ = false;
+  uint32_t lastTransitionDwellMs_ = 0;
+  bool transitionDwellPending_ = false;
 };

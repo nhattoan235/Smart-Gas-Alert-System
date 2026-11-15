@@ -15,7 +15,7 @@ bool MqttLite::connect(const char *host,uint16_t port,const char *id,const char 
   if(user && *user) payloadSize+=2+strlen(user);
   if(pass && *pass) payloadSize+=2+strlen(pass);
   if(payloadSize>512) return false;
-  client_.stop(); rxLen_=0; ackSeq_=0; client_.setTimeout(2);
+  client_.stop(); rxLen_=0; ackHead_=ackCount_=0; client_.setTimeout(2);
   if(!client_.connect(host,port,750)) return false;
   uint8_t body[512]; size_t i=0;
   i+=putString(body+i,"MQTT"); body[i++]=4;
@@ -55,9 +55,12 @@ bool MqttLite::subscribe(const char *topic) {
   return writePacket(0x82,body,i);
 }
 bool MqttLite::takeCommitAck(char *boot,size_t capacity,uint32_t &seq) {
-  if(!ackSeq_ || !capacity) return false;
-  strncpy(boot,ackBoot_,capacity-1); boot[capacity-1]=0;
-  seq=ackSeq_; ackSeq_=0;
+  if(!ackCount_ || !capacity) return false;
+  strncpy(boot,ackBoot_[ackHead_],capacity-1); boot[capacity-1]=0;
+  seq=ackSeq_[ackHead_];
+  ackSeq_[ackHead_]=0;
+  ackHead_=(ackHead_+1)%COMMIT_ACK_CAPACITY;
+  ackCount_--;
   return true;
 }
 void MqttLite::loop() {
@@ -79,13 +82,16 @@ void MqttLite::loop() {
       size_t topicLen=(rx_[p]<<8)|rx_[p+1];
       if(topicLen+2<=remain && topicLen==strlen(ackTopic_) && memcmp(rx_+p+2,ackTopic_,topicLen)==0) {
         size_t payloadLen=remain-topicLen-2;
-        if(payloadLen<sizeof(ackBoot_)+12 && payloadLen>2) {
+        if(payloadLen<48 && payloadLen>2) {
           char value[48]; memcpy(value,rx_+p+2+topicLen,payloadLen); value[payloadLen]=0;
           char *separator=strchr(value,':');
-          if(separator && separator-value>0 && separator-value<(int)sizeof(ackBoot_)) {
+          if(separator && separator-value>0 && separator-value<(int)sizeof(ackBoot_[0])) {
             *separator=0;
             char *end=nullptr; unsigned long parsed=strtoul(separator+1,&end,10);
-            if(end && *end==0 && parsed>0) { strcpy(ackBoot_,value); ackSeq_=(uint32_t)parsed; }
+            if(end && *end==0 && parsed>0 && ackCount_<COMMIT_ACK_CAPACITY) {
+              uint8_t slot=(ackHead_+ackCount_)%COMMIT_ACK_CAPACITY;
+              strcpy(ackBoot_[slot],value); ackSeq_[slot]=(uint32_t)parsed; ackCount_++;
+            }
           }
         }
       }

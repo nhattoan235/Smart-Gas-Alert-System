@@ -19,63 +19,106 @@ static float median5(const float a[5]) {
   return b[2];
 }
 
+static int stateSeverity(AlarmState state) {
+  switch (state) {
+    case AlarmState::SAFE: return 1;
+    case AlarmState::WATCH: return 2;
+    case AlarmState::WARNING: return 3;
+    case AlarmState::FAULT: return 4;
+    case AlarmState::DANGER: return 5;
+    default: return 0;
+  }
+}
+
+void Detector::recordUpwardTransition(AlarmState previousState, uint32_t now) {
+  if (state_ == previousState ||
+      (state_ != AlarmState::FAULT && stateSeverity(state_) <= stateSeverity(previousState))) return;
+  const DetectorTimer *conditionTimer = nullptr;
+  switch (state_) {
+    case AlarmState::WATCH: conditionTimer = &watchSince_; break;
+    case AlarmState::WARNING: conditionTimer = &warningSince_; break;
+    case AlarmState::DANGER: conditionTimer = &dangerSince_; break;
+    case AlarmState::FAULT: conditionTimer = &invalidSince_; break;
+    default: return;
+  }
+  if (!conditionTimer->active) return;
+  lastTransitionDwellMs_ = (uint32_t)(now - conditionTimer->startedAt);
+  transitionDwellPending_ = true;
+}
+
 AlarmState Detector::update(float signal, bool valid, uint32_t now) {
+  const AlarmState previousState = state_;
+  transitionDwellPending_ = false;
   if (!valid || !isfinite(signal) || signal<0 || signal>100) {
-    validSince_=0;
-    if (!invalidSince_) invalidSince_=now ? now : 1;
-    if (now-invalidSince_>=3000) { state_=AlarmState::FAULT; inspectionRequired_=true; inspected_=false; }
+    validSince_.reset();
+    if (state_==AlarmState::WARMUP) recoverySince_.reset();
+    clearSince_.reset(); warningSince_.reset(); dangerSince_.reset();
+    watchSince_.reset(); slowRiseSince_.reset();
+    samples_=0; index_=0; reseedFiltered_=true;
+    inspected_=false;
+    invalidSince_.start(now);
+    if (invalidSince_.elapsed(now,3000)) { state_=AlarmState::FAULT; inspectionRequired_=true; inspected_=false; }
+    recordUpwardTransition(previousState,now);
     return state_;
   }
-  invalidSince_=0;
-  if (!validSince_) validSince_=now ? now : 1;
+  invalidSince_.reset();
+  validSince_.start(now);
   recent_[index_++ % 5]=signal;
   if (samples_<5) samples_++;
   if (samples_<5) return state_;
   float smooth=median5(recent_);
-  if (!recoverySince_) {
+  if (!recoverySince_.active) {
     filtered_=baseline_=smooth;
-    recoverySince_=now ? now : 1;
+    recoverySince_.start(now);
+    reseedFiltered_=false;
+  } else if (reseedFiltered_) {
+    filtered_=smooth;
+    reseedFiltered_=false;
   } else filtered_=0.35f*smooth+0.65f*filtered_;
   float delta=filtered_-baseline_;
   bool high=smooth>=65 || filtered_>=62;
   bool warning=filtered_>=28 || delta>=20;
   // A small but persistent rise is worth watching, never a calibrated leak claim.
-  if (delta>=4 && filtered_>=7) { if (!slowRiseSince_) slowRiseSince_=now ? now : 1; }
-  else slowRiseSince_=0;
-  bool slowRise=slowRiseSince_ && now-slowRiseSince_>=30000;
+  if (delta>=4 && filtered_>=7) slowRiseSince_.start(now);
+  else slowRiseSince_.reset();
+  bool slowRise=slowRiseSince_.elapsed(now,30000);
   bool watch=filtered_>=12 || delta>=8 || slowRise;
-  if (high) { if (!dangerSince_) dangerSince_=now ? now : 1; }
-  else dangerSince_=0;
-  if (warning) { if (!warningSince_) warningSince_=now ? now : 1; }
-  else warningSince_=0;
-  if (watch) { if (!watchSince_) watchSince_=now ? now : 1; }
-  else watchSince_=0;
-  if (dangerSince_ && now-dangerSince_>=1000) {
+  if (high) dangerSince_.start(now);
+  else dangerSince_.reset();
+  if (warning) warningSince_.start(now);
+  else warningSince_.reset();
+  if (watch) watchSince_.start(now);
+  else watchSince_.reset();
+  if (dangerSince_.elapsed(now,1000)) {
     state_=AlarmState::DANGER; inspectionRequired_=true; inspected_=false;
-  } else if (state_!=AlarmState::DANGER && warningSince_ && now-warningSince_>=5000) {
+  } else if (state_!=AlarmState::DANGER && warningSince_.elapsed(now,5000)) {
     state_=AlarmState::WARNING; inspectionRequired_=true; inspected_=false;
-  } else if ((state_==AlarmState::SAFE || state_==AlarmState::WARMUP) && watchSince_ && now-watchSince_>=6000) state_=AlarmState::WATCH;
-  if (state_==AlarmState::FAULT && now-validSince_>=5000 && !watch && !warning && !high) state_=AlarmState::WATCH;
-  if (state_==AlarmState::WARMUP && now-recoverySince_>=5000 && !watch && !warning && !high) state_=AlarmState::SAFE;
+  } else if ((state_==AlarmState::SAFE || state_==AlarmState::WARMUP) && watchSince_.elapsed(now,6000)) state_=AlarmState::WATCH;
+  // Once input has been valid for the recovery interval, leave FAULT through WATCH
+  // unless a warning or danger condition is active. A WATCH-band signal is still
+  // a monitored state; it must not keep the sensor fault latched or jump to SAFE.
+  if (state_==AlarmState::FAULT && validSince_.elapsed(now,5000) && !warning && !high) state_=AlarmState::WATCH;
+  if (state_==AlarmState::WARMUP && recoverySince_.elapsed(now,5000) && !watch && !warning && !high) state_=AlarmState::SAFE;
   if (state_==AlarmState::WATCH || state_==AlarmState::WARNING || state_==AlarmState::DANGER) {
     bool clear=!high && !warning && !watch && delta<5;
     if (clear) {
-      if (!clearSince_) clearSince_=now ? now : 1;
-      if (now-clearSince_>=10000) {
+      clearSince_.start(now);
+      if (clearSince_.elapsed(now,10000)) {
         if (state_==AlarmState::WARNING || state_==AlarmState::DANGER) {
           state_=AlarmState::WATCH;
-          clearSince_=now ? now : 1;
+          clearSince_.restart(now);
         } else if (!inspectionRequired_ || inspected_) {
           state_=AlarmState::SAFE;
           inspectionRequired_=false;
           inspected_=false;
           baseline_=filtered_;
-          warningSince_=watchSince_=dangerSince_=0;
+          warningSince_.reset(); watchSince_.reset(); dangerSince_.reset();
         }
       }
-    } else clearSince_=0;
+    } else clearSince_.reset();
   }
-  if (state_==AlarmState::SAFE && !watch && !warning && !high && !slowRiseSince_)
+  if (state_==AlarmState::SAFE && !watch && !warning && !high && !slowRiseSince_.active)
     baseline_=0.995f*baseline_+0.005f*filtered_;
+  recordUpwardTransition(previousState,now);
   return state_;
 }

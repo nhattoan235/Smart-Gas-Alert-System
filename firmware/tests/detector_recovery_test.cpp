@@ -1,0 +1,305 @@
+// Lightweight standalone regression harness for Detector fault recovery.
+// Run from firmware/ with a host C++ compiler:
+//   g++ -std=c++11 -Iinclude tests/detector_recovery_test.cpp src/Detector.cpp -o detector_recovery_test
+//   ./detector_recovery_test
+
+#include <cassert>
+#include <cstdio>
+#include <stdint.h>
+
+#include "../include/Detector.h"
+
+static void enterFault(Detector &detector, uint32_t &recoveryStart) {
+  for (uint32_t now = 0; now <= 6000; now += 100)
+    detector.update(5.0f, true, now);
+  assert(detector.state() == AlarmState::SAFE);
+
+  for (uint32_t now = 6100; now <= 9100; now += 100)
+    detector.update(5.0f, false, now);
+  assert(detector.state() == AlarmState::FAULT);
+  recoveryStart = 9200;
+}
+
+static AlarmState recoverAt(float signal) {
+  Detector detector;
+  uint32_t recoveryStart = 0;
+  enterFault(detector, recoveryStart);
+
+  for (uint32_t now = recoveryStart; now <= recoveryStart + 5000; now += 100)
+    detector.update(signal, true, now);
+  return detector.state();
+}
+
+static void testBelowWatchRecoveryEntersWatch() {
+  assert(recoverAt(5.0f) == AlarmState::WATCH);
+}
+
+static void testWatchBandRecoveryEntersWatch() {
+  assert(recoverAt(15.0f) == AlarmState::WATCH);
+}
+
+static void testWarningPrecedesFaultRecovery() {
+  Detector detector;
+  uint32_t recoveryStart = 0;
+  enterFault(detector, recoveryStart);
+
+  for (uint32_t now = recoveryStart; now <= recoveryStart + 9000; now += 100)
+    detector.update(30.0f, true, now);
+  assert(detector.state() == AlarmState::WARNING);
+}
+
+static void testDangerPrecedesFaultRecovery() {
+  Detector detector;
+  uint32_t recoveryStart = 0;
+  enterFault(detector, recoveryStart);
+
+  for (uint32_t now = recoveryStart; now <= recoveryStart + 2500; now += 100)
+    detector.update(70.0f, true, now);
+  assert(detector.state() == AlarmState::DANGER);
+}
+
+static void testInvalidSampleRestartsFaultRecoveryDwell() {
+  Detector detector;
+  uint32_t recoveryStart = 0;
+  enterFault(detector, recoveryStart);
+  for (uint32_t now = recoveryStart; now <= recoveryStart + 4800; now += 100)
+    assert(detector.update(5.0f, true, now) == AlarmState::FAULT);
+  assert(detector.update(5.0f, false, recoveryStart + 4900) == AlarmState::FAULT);
+  for (uint32_t now = recoveryStart + 5000; now <= recoveryStart + 9800; now += 100)
+    assert(detector.update(5.0f, true, now) == AlarmState::FAULT);
+  assert(detector.update(5.0f, true, recoveryStart + 9900) == AlarmState::FAULT);
+  assert(detector.update(5.0f, true, recoveryStart + 10000) == AlarmState::WATCH);
+}
+
+static void testInvalidWarmupRestartsRecoveryInterval() {
+  Detector detector;
+  for (uint32_t now = 0; now <= 1800; now += 100)
+    detector.update(5.0f, true, now);
+  for (uint32_t now = 1900; now <= 2100; now += 100)
+    detector.update(5.0f, false, now);
+  for (uint32_t now = 2200; now <= 5500; now += 100)
+    detector.update(5.0f, true, now);
+  assert(detector.state() == AlarmState::WARMUP);
+  for (uint32_t now = 5600; now <= 8000; now += 100)
+    detector.update(5.0f, true, now);
+  assert(detector.state() == AlarmState::SAFE);
+}
+
+static void testInvalidResetsWarningDwell() {
+  Detector warning;
+  for (uint32_t now = 0; now <= 6000; now += 100)
+    warning.update(5.0f, true, now);
+  for (uint32_t now = 6100; now <= 10000; now += 100)
+    warning.update(30.0f, true, now);
+  for (uint32_t now = 10100; now <= 10300; now += 100)
+    warning.update(30.0f, false, now);
+  for (uint32_t now = 10400; now <= 15700; now += 100)
+    warning.update(30.0f, true, now);
+  assert(warning.state() != AlarmState::WARNING);
+  assert(warning.update(30.0f, true, 15800) == AlarmState::WARNING);
+}
+
+static void testInvalidResetsDangerDwellAndMedianWindow() {
+  Detector detector;
+  for (uint32_t now = 0; now <= 6000; now += 100)
+    detector.update(5.0f, true, now);
+  for (uint32_t now = 6100; now <= 6500; now += 100)
+    detector.update(70.0f, true, now);
+  for (uint32_t now = 6600; now <= 8600; now += 100)
+    detector.update(70.0f, false, now);
+  assert(detector.update(70.0f, true, 8700) != AlarmState::DANGER);
+}
+
+static void testInvalidResetsInspectionClearTimer() {
+  Detector detector;
+  for (uint32_t now = 0; now <= 6000; now += 100)
+    detector.update(5.0f, true, now);
+  for (uint32_t now = 6100; now <= 16000; now += 100)
+    detector.update(30.0f, true, now);
+  for (uint32_t now = 16100; now <= 50000; now += 100)
+    detector.update(5.0f, true, now);
+  assert(detector.state() == AlarmState::WATCH);
+  assert(detector.canConfirmInspection(50000));
+  detector.update(5.0f, false, 50100);
+  assert(!detector.canConfirmInspection(50100));
+  for (uint32_t now = 50200; now <= 60500; now += 100)
+    detector.update(5.0f, true, now);
+  assert(!detector.canConfirmInspection(60500));
+  detector.update(5.0f, true, 60600);
+  assert(detector.canConfirmInspection(60600));
+}
+
+static void testIsolatedImpulseDoesNotRaiseAlarm() {
+  Detector detector;
+  for (uint32_t now = 0; now <= 6000; now += 100)
+    detector.update(5.0f, true, now);
+  detector.update(70.0f, true, 6100);
+  for (uint32_t now = 6200; now <= 20000; now += 100)
+    detector.update(5.0f, true, now);
+  assert(detector.state() == AlarmState::SAFE);
+}
+
+static void testSlowSustainedRiseReachesWatch() {
+  Detector detector;
+  for (uint32_t now = 0; now <= 6000; now += 100)
+    detector.update(5.0f, true, now);
+  for (uint32_t now = 6100; now <= 52000; now += 100)
+    detector.update(10.0f, true, now);
+  assert(detector.state() == AlarmState::WATCH);
+}
+
+static void testTimersSurviveMillisWrap() {
+  Detector detector;
+  const uint32_t start = 0xFFFFF123UL;
+  for (uint32_t elapsed = 0; elapsed <= 7000; elapsed += 100)
+    detector.update(5.0f, true, start + elapsed);
+  assert(detector.state() == AlarmState::SAFE);
+}
+
+static void testInvalidTimerStartsAtZero() {
+  Detector detector;
+  assert(detector.update(5.0f, false, 0) == AlarmState::WARMUP);
+  assert(detector.update(5.0f, false, 0) == AlarmState::WARMUP);
+  for (uint32_t now = 100; now <= 2900; now += 100)
+    assert(detector.update(5.0f, false, now) == AlarmState::WARMUP);
+  assert(detector.update(5.0f, false, 2999) == AlarmState::WARMUP);
+  assert(detector.update(5.0f, false, 3000) == AlarmState::FAULT);
+  uint32_t dwellMs = 0;
+  assert(detector.takeTransitionDwellMs(dwellMs));
+  assert(dwellMs == 3000);
+}
+
+static void testValidRecoveryTimerStartsAtZero() {
+  Detector detector;
+  const uint32_t start = 0U - 10000U;
+  for (uint32_t elapsed = 0; elapsed <= 6000; elapsed += 100)
+    detector.update(5.0f, true, start + elapsed);
+  for (uint32_t elapsed = 6100; elapsed <= 9900; elapsed += 100)
+    detector.update(5.0f, false, start + elapsed);
+  assert(detector.state() == AlarmState::FAULT);
+  for (uint32_t elapsed = 10000; elapsed <= 14900; elapsed += 100)
+    assert(detector.update(5.0f, true, start + elapsed) == AlarmState::FAULT);
+  assert(detector.update(5.0f, true, 4999) == AlarmState::FAULT);
+  assert(detector.update(5.0f, true, 5000) == AlarmState::WATCH);
+}
+
+static void testWarningTimerStartsAtZero() {
+  Detector detector;
+  const uint32_t start = 0U - 12000U;
+  for (uint32_t elapsed = 0; elapsed <= 11600; elapsed += 100)
+    detector.update(5.0f, true, start + elapsed);
+  assert(detector.state() == AlarmState::SAFE);
+  for (uint32_t elapsed = 11700; elapsed <= 12000; elapsed += 100) {
+    AlarmState state = detector.update(50.0f, true, start + elapsed);
+    if (elapsed == 12000) assert(state != AlarmState::WARNING);
+  }
+  for (uint32_t elapsed = 12100; elapsed <= 16900; elapsed += 100)
+    assert(detector.update(50.0f, true, start + elapsed) != AlarmState::WARNING);
+  assert(detector.update(50.0f, true, 5000) == AlarmState::WARNING);
+  uint32_t dwellMs = 0;
+  assert(detector.takeTransitionDwellMs(dwellMs));
+  assert(dwellMs == 5000);
+}
+
+static void testDangerTimerStartsAtZero() {
+  Detector detector;
+  const uint32_t start = 0U - 12000U;
+  for (uint32_t elapsed = 0; elapsed <= 11700; elapsed += 100)
+    detector.update(5.0f, true, start + elapsed);
+  assert(detector.state() == AlarmState::SAFE);
+  for (uint32_t elapsed = 11800; elapsed <= 12000; elapsed += 100) {
+    AlarmState state = detector.update(100.0f, true, start + elapsed);
+    if (elapsed == 12000) assert(state != AlarmState::DANGER);
+  }
+  assert(detector.update(100.0f, true, 999) != AlarmState::DANGER);
+  assert(detector.update(100.0f, true, 1000) == AlarmState::DANGER);
+  uint32_t dwellMs = 0;
+  assert(detector.takeTransitionDwellMs(dwellMs));
+  assert(dwellMs == 1000);
+}
+
+static void testClearTimerStartsAtZero() {
+  Detector detector;
+  const uint32_t start = 0U - 20000U;
+  for (uint32_t elapsed = 0; elapsed <= 6000; elapsed += 100)
+    detector.update(5.0f, true, start + elapsed);
+  for (uint32_t elapsed = 6100; elapsed <= 9100; elapsed += 100)
+    detector.update(5.0f, false, start + elapsed);
+  assert(detector.state() == AlarmState::FAULT);
+  for (uint32_t elapsed = 9200; elapsed <= 14900; elapsed += 100)
+    detector.update(5.0f, false, start + elapsed);
+  for (uint32_t elapsed = 15000; elapsed <= 20000; elapsed += 100)
+    detector.update(5.0f, true, start + elapsed);
+  assert(detector.state() == AlarmState::WATCH);
+  assert(!detector.canConfirmInspection(0));
+  detector.update(5.0f, true, 9999);
+  assert(!detector.canConfirmInspection(9999));
+  detector.update(5.0f, true, 10000);
+  assert(detector.canConfirmInspection(10000));
+}
+
+static void testScalarInputCannotIdentifyPhysicalFailureCause() {
+  // This demonstrates an interface limit only: negative masking and a stuck
+  // normal sensor can present the same scalar value/valid bit as a quiet room.
+  // Detector::update has no raw-channel metadata or independent stuck/drift
+  // diagnostics, so it cannot distinguish those physical cases in this harness.
+  Detector quietScenario, maskedScenario, stuckScenario;
+  for (uint32_t now = 0; now <= 6000; now += 100) {
+    quietScenario.update(5.0f, true, now);
+    maskedScenario.update(5.0f, true, now);
+    stuckScenario.update(5.0f, true, now);
+  }
+  assert(quietScenario.state() == maskedScenario.state());
+  assert(quietScenario.state() == stuckScenario.state());
+}
+
+static void testAdversarialNegativeInterferenceCanMaskRelativeRise() {
+  Detector unobstructed, masked;
+  for (uint32_t now = 0; now <= 6000; now += 100) {
+    unobstructed.update(5.0f, true, now);
+    masked.update(5.0f, true, now);
+  }
+  assert(unobstructed.state() == AlarmState::SAFE);
+  assert(masked.state() == AlarmState::SAFE);
+
+  // Adversarial simulation values use the existing maximum negative noise and
+  // environment-bias terms: 28 - 15 - 8 == the learned baseline of 5. The
+  // scalar reaching Detector is therefore indistinguishable from a quiet room.
+  // This test documents the identifiability limit; it does not tune thresholds
+  // or claim that software can recover information canceled before sampling.
+  for (uint32_t now = 6100; now <= 15100; now += 100) {
+    const float leakWithoutMask = 28.0f;
+    const float simulatedInterference = -15.0f;
+    const float simulatedEnvironmentBias = -8.0f;
+    const float leakAfterMask = leakWithoutMask + simulatedInterference +
+                                simulatedEnvironmentBias;
+    unobstructed.update(leakWithoutMask, true, now);
+    masked.update(leakAfterMask, true, now);
+  }
+  assert(unobstructed.state() == AlarmState::WARNING);
+  assert(masked.state() == AlarmState::SAFE);
+}
+
+int main() {
+  testBelowWatchRecoveryEntersWatch();
+  testWatchBandRecoveryEntersWatch();
+  testWarningPrecedesFaultRecovery();
+  testDangerPrecedesFaultRecovery();
+  testInvalidSampleRestartsFaultRecoveryDwell();
+  testInvalidWarmupRestartsRecoveryInterval();
+  testInvalidResetsWarningDwell();
+  testInvalidResetsDangerDwellAndMedianWindow();
+  testInvalidResetsInspectionClearTimer();
+  testIsolatedImpulseDoesNotRaiseAlarm();
+  testSlowSustainedRiseReachesWatch();
+  testTimersSurviveMillisWrap();
+  testInvalidTimerStartsAtZero();
+  testValidRecoveryTimerStartsAtZero();
+  testWarningTimerStartsAtZero();
+  testDangerTimerStartsAtZero();
+  testClearTimerStartsAtZero();
+  testScalarInputCannotIdentifyPhysicalFailureCause();
+  testAdversarialNegativeInterferenceCanMaskRelativeRise();
+  std::puts("Detector recovery regression cases passed.");
+  return 0;
+}

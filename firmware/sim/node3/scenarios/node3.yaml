@@ -1,0 +1,62 @@
+name: 'Node 3 CO warning danger and inspected recovery'
+version: 1
+author: 'Smart Gas Alert automated tests'
+steps:
+  - set-control:
+      part-id: lpg
+      name: position
+      value: 0.03
+  - set-control:
+      part-id: co
+      name: position
+      value: 0.03
+  - set-control:
+      part-id: temp
+      name: position
+      value: 0.45
+  - set-control:
+      part-id: humid
+      name: position
+      value: 0.50
+  - set-control:
+      part-id: interference
+      name: position
+      value: 0.50
+  - wait-serial: 'node3: LPG SAFE'
+  - set-control:
+      part-id: co
+      name: position
+      value: 0.38
+  - wait-serial: 'CO WARNING'
+  - expect-pin:
+      part-id: esp
+      name: '6'
+      value: 1
+  - set-control:
+      part-id: co
+      name: position
+      value: 0.80
+  - wait-serial: 'CO DANGER'
+  - expect-pin:
+      part-id: esp
+      name: '7'
+      value: 1
+  - set-control:
+      part-id: co
+      name: position
+      value: 0.03
+  - wait-serial: 'CO WATCH'
+  - delay: 10000ms
+  - set-control:
+      part-id: inspect
+      name: pressed
+      value: 1
+  - wait-serial: 'node3: LPG SAFE 3.0%, CO SAFE 3.0%'
+  - set-control:
+      part-id: inspect
+      name: pressed
+      value: 0
+  - expect-pin:
+      part-id: esp
+      name: '5'
+      value: 1
