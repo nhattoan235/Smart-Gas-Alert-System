@@ -1,69 +1,107 @@
-# Chạy full test trên Windows
+# Hướng dẫn chạy kiểm thử trên Windows
 
-Tài liệu này dành cho người clone nhánh `Thien` để chạy bộ kiểm thử đầy đủ. Không gửi token hoặc mật khẩu vào chat, email công khai, source code hay commit Git.
+Tài liệu này dành cho người chạy repo ở nhánh `Thien`. Chạy lệnh trong PowerShell, tại thư mục repo. Không gửi Wokwi token hoặc mật khẩu MQTT qua chat, email, source code hay commit Git.
 
-## Lưu ý về số PASS
+## Chọn quick hay full
 
-`full` **không tiếp tục một phiên trước từ PASS 51**. Mỗi lần chạy tạo thư mục kết quả mới theo thời gian trong `test-results/`; chế độ full chạy lại các kiểm tra quick trước, sau đó mới chạy các bước bổ sung. Xem số PASS trong `summary.md` của đúng lần chạy; không cộng kết quả của nhiều lần với nhau.
+### Quick
 
-## 1. Tải nhánh
-
-```powershell
-git clone -b Thien https://github.com/nhattoan235/Smart-Gas-Alert-System.git
-Set-Location Smart-Gas-Alert-System
-```
-
-## 2. Cài công cụ cần thiết
-
-- Python 3 và PlatformIO Core để build firmware.
-- Gói Python dùng cho kiểm tra chứng chỉ:
+Chạy nhóm kiểm thử nhanh tại máy, không build firmware và không chạy Wokwi runtime. **Không cần Wokwi token hay mật khẩu MQTT.**
 
 ```powershell
-python -m pip install platformio cryptography
+.\tools\run-all-tests.ps1 -Mode quick
 ```
 
-- Wokwi CLI: xem [hướng dẫn cài chính thức cho Windows](https://docs.wokwi.com/wokwi-ci/cli-installation). Token dùng với CLI được tạo riêng ở bước tiếp theo.
-- Để có thêm test PASS: cài Node.js và một trình biên dịch C++ host (`g++`, `clang++`, hoặc `cl.exe`). Thiếu compiler sẽ khiến các test C++ bị đánh dấu BLOCKED.
-- Một số runtime cần VS Code, extension Wokwi và Private IoT Gateway. Test tương thích broker cần `mosquitto.exe` cùng `mosquitto_passwd.exe`.
+### Full
 
-Full runner không tự cài/nâng cấp bộ PlatformIO đã khóa phiên bản. Trên máy mới, preflight có thể báo BLOCKED nếu các package/compiler PlatformIO cần thiết chưa có hoặc không khớp; xem `platformio-toolchain-preflight.log` trong thư mục kết quả.
-
-## 3. Tạo Wokwi CLI token
-
-1. Đăng nhập tài khoản Wokwi của người chạy test.
-2. Mở [Wokwi CI Dashboard](https://wokwi.com/dashboard/ci) và tạo API token.
-3. Token hợp lệ bắt đầu bằng `wok_`; tài liệu Wokwi ghi token dài 44 ký tự. Giữ token riêng tư và không lưu vào repo. Xem [hướng dẫn xác thực Wokwi CLI](https://docs.wokwi.com/wokwi-ci/cli-usage).
-
-## 4. Chuẩn bị thông tin MQTT
-
-Cần mật khẩu MQTT cho tài khoản broker mà người chạy được phép sử dụng. Đây là **mật khẩu broker**, không phải Wokwi token. Nếu dùng broker riêng, cấu hình host và username phù hợp trong `firmware/platformio.ini`; bảo đảm Wokwi có thể tới broker nếu kịch bản cần kết nối mạng. Không dùng hoặc chia sẻ mật khẩu broker của người khác khi chưa được cho phép.
-
-## 5. Nhập token và mật khẩu an toàn
-
-Trong PowerShell, tại thư mục repository, chạy:
-
-```powershell
-.\tools\save-test-secrets.ps1
-```
-
-Script hỏi lần lượt:
-
-1. `Wokwi CLI token`: nhập token vừa tạo.
-2. `MQTT build password`: nhập mật khẩu broker.
-
-Hai ô nhập là dạng bảo mật nên ký tự có thể không hiện trên màn hình. Nhập xong mỗi giá trị thì nhấn Enter. Script lưu chúng đã mã hóa theo tài khoản Windows hiện tại tại `%LOCALAPPDATA%\SmartGasAlertSystem`; không đưa file này lên GitHub và không chép file đã mã hóa sang máy Windows khác.
-
-## 6. Chạy full
+Chạy các kiểm tra quick trước, sau đó build firmware và thực hiện các kiểm thử bổ sung, gồm các kịch bản Wokwi runtime. Cần cài công cụ ở mục 2 và lưu Wokwi token cùng mật khẩu MQTT theo mục 5.
 
 ```powershell
 .\tools\run-tests-saved.ps1 -Mode full
 ```
 
-Runner sẽ tạo thư mục `test-results/<run-id>/`. Mở `summary.md` để xem tổng số PASS/FAIL/BLOCKED/NOT_TESTED; mở `failed-tests.md` và log cùng tên để xem nguyên nhân. Token không được ghi vào log.
+**Không thể tiếp tục một lượt full từ PASS 51.** Runner không có checkpoint/resume: mỗi lần chạy tạo thư mục kết quả mới và full chạy lại từ đầu. Giữ nguyên thư mục kết quả cũ trong `test-results/` nếu muốn lưu lượt đã chạy; lượt mới có `run-id` riêng để so sánh.
 
-BLOCKED hoặc NOT_TESTED không đồng nghĩa với PASS hay FAIL: thường là thiếu toolchain, cấu hình broker, Wokwi extension/Private Gateway, hoặc runtime không được chạy. Bộ test trên mô phỏng không thay thế kiểm thử phần cứng thật.
+## 1. Tải nhánh `Thien`
 
-## Tài liệu chính thức
+Nếu chưa có repo trên máy:
+
+```powershell
+git clone --branch Thien --single-branch https://github.com/nhattoan235/Smart-Gas-Alert-System.git
+Set-Location Smart-Gas-Alert-System
+```
+
+Nếu đã clone repo rồi:
+
+```powershell
+git switch Thien
+git pull --ff-only origin Thien
+```
+
+## 2. Cài công cụ
+
+- Python 3 và PlatformIO Core để build firmware:
+
+  ```powershell
+  python -m pip install platformio cryptography
+  ```
+
+- Wokwi CLI theo [hướng dẫn cài cho Windows](https://docs.wokwi.com/wokwi-ci/cli-installation).
+- Full có thể cần VS Code, extension Wokwi và Private IoT Gateway cho các kiểm thử mô phỏng. Thiếu compiler C++ host hoặc Node.js sẽ khiến một số kiểm tra bị `BLOCKED`.
+- Trên máy mới, preflight có thể báo `BLOCKED` nếu phiên bản PlatformIO/compiler chưa đúng. Xem `platformio-toolchain-preflight.log` trong thư mục kết quả của lượt chạy.
+
+Quick chỉ cần môi trường chạy được PowerShell và các công cụ mà từng kiểm tra cần; thiếu công cụ được báo riêng trong kết quả.
+
+## 3. Lấy Wokwi token
+
+1. Người chạy đăng nhập tài khoản Wokwi của mình.
+2. Mở [Wokwi CI Dashboard](https://wokwi.com/dashboard/ci), tạo API token và sao chép token.
+3. Giữ token riêng tư. Mỗi người chạy nên tự tạo token cho tài khoản của mình; không commit token vào repo.
+
+Xem thêm [hướng dẫn xác thực Wokwi CLI](https://docs.wokwi.com/wokwi-ci/cli-usage).
+
+## 4. Chuẩn bị mật khẩu MQTT
+
+Mật khẩu MQTT **khác với** Wokwi token. Full cần mật khẩu của tài khoản broker mà người chạy được phép sử dụng để build firmware. Nếu dùng broker riêng, cấu hình host và username tương ứng trong `firmware/platformio.ini`; broker phải truy cập được từ môi trường Wokwi khi kịch bản cần kết nối.
+
+Không dùng mật khẩu của người khác nếu chưa được cho phép. Nếu chỉ chạy quick thì bỏ qua bước lấy token và mật khẩu này.
+
+## 5. Nhập và lưu thông tin cho full
+
+Tại thư mục repo, chạy:
+
+```powershell
+.\tools\save-test-secrets.ps1
+```
+
+Script lần lượt hỏi:
+
+1. `Wokwi CLI token`: dán token lấy ở mục 3 rồi nhấn Enter.
+2. `MQTT build password`: nhập mật khẩu MQTT ở mục 4 rồi nhấn Enter.
+
+Ô nhập là dạng bảo mật nên ký tự sẽ không hiện ra khi gõ hoặc dán; đó là bình thường. Script lưu hai giá trị đã mã hóa theo tài khoản Windows hiện tại tại `%LOCALAPPDATA%\SmartGasAlertSystem\test-secrets.clixml`. Không gửi hoặc chép file này sang máy/tài khoản Windows khác; bạn của m cần tự tạo token và nhập thông tin của bạn ấy trên máy bạn ấy.
+
+Nếu cần cập nhật riêng một giá trị sau khi đã tạo kho bí mật, dùng `-Update WokwiToken` hoặc `-Update MqttPassword`. Lần đầu phải chạy lệnh không tham số để lưu cả hai.
+
+## 6. Chạy và xem kết quả
+
+Quick:
+
+```powershell
+.\tools\run-all-tests.ps1 -Mode quick
+```
+
+Full:
+
+```powershell
+.\tools\run-tests-saved.ps1 -Mode full
+```
+
+Mỗi lượt tạo thư mục `test-results/<run-id>/`. Đọc `summary.md` để xem tổng `PASS`, `FAIL`, `BLOCKED` và `NOT_TESTED`; mở log tương ứng để xem chi tiết. Lưu lại thư mục của lượt PASS 51 nếu cần đối chiếu. Một lượt full mới bắt đầu lại từ đầu, không cộng số PASS giữa các lượt.
+
+`BLOCKED` và `NOT_TESTED` không đồng nghĩa với PASS hoặc FAIL; thường có nghĩa là thiếu công cụ, cấu hình hoặc runtime cần thiết. Kiểm thử mô phỏng không thay thế kiểm thử phần cứng thật.
+
+## Tài liệu Wokwi
 
 - [Wokwi CLI Installation](https://docs.wokwi.com/wokwi-ci/cli-installation)
 - [Wokwi CLI Usage và token](https://docs.wokwi.com/wokwi-ci/cli-usage)

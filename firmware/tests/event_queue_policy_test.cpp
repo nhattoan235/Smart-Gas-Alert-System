@@ -25,6 +25,12 @@ int main() {
   mixedQueue[7] = 2;
   assert(event_queue_policy::lowestStrictlyLowerVictim(mixedQueue, 16, 5) == 7);
   assert(event_queue_policy::priority("{\"state\":\"DANGER\"}") == 5);
+  assert(event_queue_policy::priority(
+             "{\"state\":\"SAFE\",\"flame_severity\":\"DANGER\",\"flame_active\":true}") == 5);
+  assert(event_queue_policy::priority(
+             "{\"state\":\"SAFE\",\"flame_severity\":\"FAULT\",\"flame_active\":true}") == 4);
+  assert(event_queue_policy::priority(
+             "{\"state\":\"SAFE\",\"flame_severity\":\"DANGER\",\"flame_active\":false}") == 1);
   std::puts("Event queue priority regression cases passed.");
   return 0;
 }

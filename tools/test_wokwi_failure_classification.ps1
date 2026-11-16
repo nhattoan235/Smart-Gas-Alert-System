@@ -36,6 +36,9 @@ if (-not (Test-WokwiTransportRetryEligible -TestName 'wokwi-node3' -Attempt 1 -S
 if (Test-WokwiTransportRetryEligible -TestName 'wokwi-node3' -Attempt 2 -Status 'BLOCKED' -ExitCode 77 -ProcessOutput $transportError) {
   throw 'Wokwi retry regression: retries must stop after one retry.'
 }
+if (-not (Test-WokwiTransportRetryEligible -TestName 'wokwi-node3-sensor-faults' -Attempt 1 -Status 'BLOCKED' -ExitCode 77 -ProcessOutput $transportError)) {
+  throw 'Wokwi retry regression: the first exact API 1006 closure in the Node 3 sensor-fault scenario should allow one bounded retry.'
+}
 if (Test-WokwiTransportRetryEligible -TestName 'wokwi-node3' -Attempt 1 -Status 'FAIL' -ExitCode 1 -ProcessOutput $scenarioFailure) {
   throw 'Wokwi retry regression: scenario assertion failures must not be retried or hidden.'
 }

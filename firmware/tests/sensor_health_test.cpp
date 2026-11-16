@@ -110,7 +110,9 @@ static void testReferenceDriftNeedsCalibrationAndVerifiedCondition() {
   policy.maxReferenceDeviationCounts = 50;
   SensorHealthMonitor monitor(policy);
   CalibrationRecord calibration{};
-  CalibrationReference reference = {1000, true};
+  CalibrationReference reference{};
+  reference.rawCounts = 1000;
+  reference.valid = true;
 
   SensorHealthStatus status = monitor.update(validRaw(1200, 0), 0,
                                               calibration, reference, true);

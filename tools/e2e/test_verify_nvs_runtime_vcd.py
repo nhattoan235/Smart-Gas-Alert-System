@@ -46,7 +46,17 @@ class NvsRuntimeVcdTests(unittest.TestCase):
             validate_runtime_vcd_path(Path("test-results/old/node1-gpio.vcd"))
 
     def test_current_run_vcd_path_is_accepted(self) -> None:
-        validate_runtime_vcd_path(Path("test-results/run-123/nvs-runtime-wokwi/nvs-runtime-gpio.vcd"))
+        validate_runtime_vcd_path(Path(
+            "test-results/20261116T054154922Z/"
+            "nvs-runtime-wokwi-20261116T054154922Z/nvs-runtime-gpio.vcd"
+        ))
+
+    def test_vcd_from_different_run_folder_is_rejected(self) -> None:
+        with self.assertRaisesRegex(VcdAssertionError, "unrelated/older VCD"):
+            validate_runtime_vcd_path(Path(
+                "test-results/20261116T054154922Z/"
+                "nvs-runtime-wokwi-20261116T052932627Z/nvs-runtime-gpio.vcd"
+            ))
 
 
 if __name__ == "__main__":

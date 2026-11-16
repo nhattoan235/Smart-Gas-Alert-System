@@ -58,10 +58,14 @@ def inspect_vcd_text(text: str) -> dict[str, object]:
 
 
 def validate_runtime_vcd_path(path: Path) -> None:
-    if path.name != "nvs-runtime-gpio.vcd" or path.parent.name != "nvs-runtime-wokwi":
+    run_id = path.parent.parent.name if len(path.parents) >= 2 else ""
+    expected_project_dir = f"nvs-runtime-wokwi-{run_id}" if run_id else ""
+    if (path.name != "nvs-runtime-gpio.vcd" or
+            path.parent.name != expected_project_dir or
+            path.parent.parent.parent.name != "test-results"):
         raise VcdAssertionError(
             "refusing to treat an unrelated/older VCD as this run's NVS runtime evidence; "
-            "expected test-results/<run-id>/nvs-runtime-wokwi/nvs-runtime-gpio.vcd"
+            "expected test-results/<run-id>/nvs-runtime-wokwi-<run-id>/nvs-runtime-gpio.vcd"
         )
 
 

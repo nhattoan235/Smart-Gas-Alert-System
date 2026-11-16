@@ -11,6 +11,7 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include "Detector.h"
+#include "FlameMonitor.h"
 #include "EventQueuePolicy.h"
 #include "EventQueueNvs.h"
 #include "MqttLite.h"
@@ -20,6 +21,9 @@
 #endif
 #ifndef SIMULATION
 #define SIMULATION 1
+#endif
+#ifndef FLAME_MONITOR_ENABLED
+#define FLAME_MONITOR_ENABLED 0
 #endif
 #ifndef HARDWARE_N8R8
 #define HARDWARE_N8R8 0
@@ -88,10 +92,18 @@ static bool calibrationRequired = true;
 static constexpr int BUZZER=4,GREEN=5,AMBER=6,RED=7;
 #if SIMULATION
 static constexpr int LPG=1,CO=2,TEMP=8,HUM=9,INTERFERENCE=10,LPG_FAULT=13,ACK=14,VALVE=15,STOVE=16,CO_FAULT=21,INSPECT=12,LPG_TRUTH=11,CO_TRUTH=17;
+#if FLAME_MONITOR_ENABLED
+static constexpr int F1=38,F2=40,BURNER1_GAS=41;
+#endif
 #endif
 // Initial sample period from the design; tune only after measured scenario tests.
 static constexpr uint32_t SAMPLE_INTERVAL_MS=100;
 static Detector lpgDetector,coDetector;
+#if FLAME_MONITOR_ENABLED
+static FlameMonitor flameMonitor;
+#endif
+static FlameInput flameInput{};
+static FlameOutput flameOutput{};
 static MqttLite mqtt;
 static Preferences eventStore;
 static String prefix,bootId;
@@ -109,7 +121,7 @@ static constexpr uint8_t EVENT_CAPACITY=16;
 static constexpr uint8_t EVENT_MAX_CAPACITY=32;
 static uint8_t eventCapacity=EVENT_CAPACITY;
 static constexpr size_t MQTT_TOPIC_CAPACITY=96;
-static constexpr size_t MQTT_PAYLOAD_CAPACITY=768;
+static constexpr size_t MQTT_PAYLOAD_CAPACITY=1024;
 static constexpr EventBits_t MQTT_CONNECTED_BIT=static_cast<EventBits_t>(1U);
 enum class PublishKind : uint8_t { EVENT=1, TELEMETRY=2 };
 struct PublishRequest {
@@ -269,6 +281,13 @@ static int severity(AlarmState s) {
 }
 static AlarmState overallState() {
   return severity(lpgDetector.state())>=severity(coDetector.state()) ? lpgDetector.state() : coDetector.state();
+}
+static AlarmState localOverallState() {
+  if(flameOutput.f1Alarm || flameOutput.f2Alarm) return AlarmState::DANGER;
+  AlarmState current=overallState();
+  if(flameOutput.faultActive && severity(current)<severity(AlarmState::FAULT))
+    return AlarmState::FAULT;
+  return current;
 }
 
 static String eventKey(uint8_t slot) { return String("e")+String(slot); }
@@ -858,8 +877,53 @@ static void pollHardwareSensors(uint32_t nowMs) {
     environmentHardwareRaw = environment;
 }
 #endif
-static String payload(const char *kind,uint32_t now,const char *changedGas="NONE",const char *action="") {
-  char buf[768];
+static FlameInput readFlameInputs(uint32_t nowMs) {
+  FlameInput input{};
+  input.nowMs=nowMs;
+#if SIMULATION && FLAME_MONITOR_ENABLED
+  input.f1Valid=true;
+  input.f1Detected=digitalRead(F1)==LOW;
+  input.f2Valid=true;
+  input.f2Detected=digitalRead(F2)==LOW;
+  input.burnerGasValid=true;
+  input.burnerGasOn=digitalRead(BURNER1_GAS)==LOW;
+#endif
+  return input;
+}
+static const char *flameCauseName(FlameCause cause) {
+  switch(cause) {
+    case FlameCause::F1_FIRE: return "F1_FIRE";
+    case FlameCause::F1_SENSOR_FAULT: return "F1_SENSOR_FAULT";
+    case FlameCause::F2_IGNITION_TIMEOUT: return "F2_IGNITION_TIMEOUT";
+    case FlameCause::F2_FLAME_LOST: return "F2_FLAME_LOST";
+    case FlameCause::F2_STARTUP_UNCONFIRMED: return "F2_STARTUP_UNCONFIRMED";
+    case FlameCause::F2_SENSOR_FAULT: return "F2_SENSOR_FAULT";
+    case FlameCause::F2_GAS_STATE_FAULT: return "F2_GAS_STATE_FAULT";
+  }
+  return "UNKNOWN";
+}
+static const char *f2StateName(F2State state) {
+  switch(state) {
+    case F2State::OFF: return "OFF";
+    case F2State::IGNITION_WAIT: return "IGNITION_WAIT";
+    case F2State::STARTUP_WAIT: return "STARTUP_WAIT";
+    case F2State::LIT: return "LIT";
+    case F2State::LOSS_CONFIRM: return "LOSS_CONFIRM";
+    case F2State::UNKNOWN: return "UNKNOWN";
+  }
+  return "UNKNOWN";
+}
+static String appendJsonFields(String json,const char *fields) {
+  if(json.length()==0 || json.charAt(json.length()-1)!='}') return String();
+  json.remove(json.length()-1);
+  json+=fields;
+  json+="}";
+  return json;
+}
+static String payload(const char *kind,uint32_t now,const char *changedGas="NONE",
+                     const char *action="",const FlameEvent *flameEvent=nullptr,
+                     const FlameInput *flameSample=nullptr) {
+  char buf[1024];
 #if SIMULATION
   const char *lpgTruthFlag = digitalRead(LPG_TRUTH)==HIGH ? "true" : "false";
   const char *coTruthFlag = digitalRead(CO_TRUTH)==HIGH ? "true" : "false";
@@ -889,7 +953,41 @@ static String payload(const char *kind,uint32_t now,const char *changedGas="NONE
     tempC,humidity,lpgTruth,interferencePct,environmentBias,lpgTruthFlag,coTruthFlag,valveFlag,stoveFlag,
     lpgDetector.inspectionRequired()||coDetector.inspectionRequired()?"true":"false",(unsigned long)lostEvents,hardwareStatusFields,simulatedFlag);
   if(written<0 || written>=(int)sizeof(buf)) return String();
-  return String(buf);
+  String result(buf);
+  char extra[256];
+#if FLAME_MONITOR_ENABLED
+  if(strcmp(kind,"telemetry")==0 && flameSample) {
+    const char *f1=flameSample->f1Valid ? (flameSample->f1Detected ? "true" : "false") : "null";
+    const char *f2=flameSample->f2Valid ? (flameSample->f2Detected ? "true" : "false") : "null";
+    const char *gas=flameSample->burnerGasValid ? (flameSample->burnerGasOn ? "true" : "false") : "null";
+    snprintf(extra,sizeof(extra),
+      ",\"f1_flame\":%s,\"f2_flame\":%s,\"burner1_gas_state\":%s,\"f2_state\":\"%s\"",
+      f1,f2,gas,f2StateName(flameOutput.f2State));
+    result=appendJsonFields(result,extra);
+  }
+#else
+  (void)flameSample;
+#endif
+#if FLAME_MONITOR_ENABLED
+  if(flameEvent) {
+    const char *channel=flameEvent->channel==FlameChannel::F1 ? "F1" : "F2";
+    const char *eventSeverity=flameEvent->severity==FlameSeverity::DANGER ? "DANGER" : "FAULT";
+    if(flameEvent->channel==FlameChannel::F2) {
+      snprintf(extra,sizeof(extra),
+        ",\"flame_channel\":\"%s\",\"flame_cause\":\"%s\",\"flame_active\":%s,\"flame_severity\":\"%s\",\"burner_id\":\"burner1\"",
+        channel,flameCauseName(flameEvent->cause),flameEvent->active ? "true" : "false",eventSeverity);
+    } else {
+      snprintf(extra,sizeof(extra),
+        ",\"flame_channel\":\"%s\",\"flame_cause\":\"%s\",\"flame_active\":%s,\"flame_severity\":\"%s\"",
+        channel,flameCauseName(flameEvent->cause),flameEvent->active ? "true" : "false",eventSeverity);
+    }
+    result=appendJsonFields(result,extra);
+  }
+#else
+  (void)flameEvent;
+#endif
+  if(result.length()>=MQTT_PAYLOAD_CAPACITY) return String();
+  return result;
 }
 void setup() {
   Serial.begin(115200);
@@ -903,6 +1001,9 @@ void setup() {
 #if SIMULATION
   pinMode(LPG_FAULT,INPUT_PULLUP); pinMode(CO_FAULT,INPUT_PULLUP); pinMode(ACK,INPUT_PULLUP); pinMode(INSPECT,INPUT_PULLUP);
   pinMode(VALVE,INPUT); pinMode(STOVE,INPUT); pinMode(LPG_TRUTH,INPUT); pinMode(CO_TRUTH,INPUT);
+#if FLAME_MONITOR_ENABLED
+  pinMode(F1,INPUT_PULLUP); pinMode(F2,INPUT_PULLUP); pinMode(BURNER1_GAS,INPUT_PULLUP);
+#endif
   analogReadResolution(12);
   // Tone.cpp defaults to LEDC channel 0, timer 0, and configures that timer
   // only after attaching the pin. Initialize the matching timer/channel first.
@@ -1048,7 +1149,7 @@ void loop() {
 #if SIMULATION
   bool ackPressed=digitalRead(ACK)==LOW;
   if(ackPressed && !priorAck) {
-    AlarmState current=overallState();
+    AlarmState current=localOverallState();
     if(current==AlarmState::WARNING || current==AlarmState::FAULT || current==AlarmState::DANGER) {
       if(current!=AlarmState::DANGER) muteUntil=now+30000;
       String event=payload("event",now,"NONE",current==AlarmState::DANGER?"ACK_DENIED_DANGER":"MUTE_30S");
@@ -1079,12 +1180,20 @@ void loop() {
     }
     lastSampleUs=acquisitionStart;
     readInputs();
+#if FLAME_MONITOR_ENABLED
+    flameInput=readFlameInputs(sampleNowMs);
+    flameOutput=flameMonitor.update(flameInput);
+#else
+    flameInput=FlameInput{};
+    flameInput.nowMs=sampleNowMs;
+    flameOutput=FlameOutput{};
+#endif
     AlarmState lpg=lpgDetector.update(lpgSignal,lpgValid,sampleNowMs);
     AlarmState co=coDetector.update(coSignal,coValid,sampleNowMs);
     uint32_t lpgDwellMs=0,coDwellMs=0;
     bool lpgTransitionTimed=lpgDetector.takeTransitionDwellMs(lpgDwellMs);
     bool coTransitionTimed=coDetector.takeTransitionDwellMs(coDwellMs);
-    localAlarm(overallState(),sampleNowMs);
+    localAlarm(localOverallState(),sampleNowMs);
     uint32_t alarmLatency=micros()-acquisitionStart;
     if(alarmLatency>maxAcquireToAlarmUs) maxAcquireToAlarmUs=alarmLatency;
     if(lpgTransitionTimed) {
@@ -1102,11 +1211,21 @@ void loop() {
       if(event.length()) queueEvent(event);
       priorLpg=lpg; priorCo=co;
     }
+#if FLAME_MONITOR_ENABLED
+    for(uint8_t i=0;i<flameOutput.eventCount;i++) {
+      const FlameEvent &event=flameOutput.events[i];
+      const char *channel=event.channel==FlameChannel::F1 ? "F1" : "F2";
+      Serial.printf("flame_event channel=%s cause=%s active=%u\n",channel,
+        flameCauseName(event.cause),event.active ? 1U : 0U);
+      String message=payload("event",sampleNowMs,"NONE","",&event,&flameInput);
+      if(message.length()) queueEvent(message);
+    }
+#endif
   }
   pumpEvents(now);
   if(mqttTaskReady && now-lastPublish>=2000 && (xEventGroupGetBits(mqttEventGroup)&MQTT_CONNECTED_BIT)) {
     lastPublish=now;
-    String p=payload("telemetry",now);
+    String p=payload("telemetry",now,"NONE","",nullptr,&flameInput);
     if(p.length()) {
       PublishRequest telemetry{};
       telemetry.kind=PublishKind::TELEMETRY;

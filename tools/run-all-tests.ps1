@@ -25,6 +25,7 @@ $script:pioCoreDir = Join-Path $runDir 'platformio-core'
 $script:pioPackagesDir = $null
 $script:pioModule = $false
 $script:mqttCaCertPath = $null
+$script:tlsRuntimePassword = $null
 $script:pythonVersion = 'unavailable'
 $script:pioVersion = 'unavailable'
 $script:wokwiVersion = 'unavailable'
@@ -41,9 +42,15 @@ function Invoke-ScrubbedVersionProbe([string]$Executable, [string[]]$Arguments) 
   $output = ''
   $exitCode = $null
   try {
+    # Some native tools (including Mosquitto -h) write informational text to
+    # stderr. Capture it as probe output without letting the runner's global
+    # Stop preference abort startup.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     $output = (& $Executable @Arguments 2>&1 | Out-String).Trim()
     $exitCode = $LASTEXITCODE
   } finally {
+    if ($null -ne $previousErrorActionPreference) { $ErrorActionPreference = $previousErrorActionPreference }
     foreach ($name in $sensitiveEnvironmentNames) {
       Remove-Item -LiteralPath ("Env:" + $name) -ErrorAction SilentlyContinue
       if ($savedEnvironment.ContainsKey($name)) { Set-Item -LiteralPath ("Env:" + $name) -Value ([string]$savedEnvironment[$name]) }
@@ -189,6 +196,7 @@ function Protect-DiagnosticText([AllowNull()][string]$Text) {
   if ($null -eq $Text) { return '' }
   $safe = [regex]::Replace($Text, 'wok_[A-Za-z0-9_-]{20,}', '[REDACTED_WOKWI_TOKEN]')
   $safe = [regex]::Replace($safe, '(?i)((?:WOKWI_CLI_TOKEN|GAS_MQTT_PASSWORD|MQTT_PASSWORD|WIFI_PASSWORD|GAS_SYNC_TOKEN|GAS_SYNC_API_TOKEN)\s*[=:]\s*)\S+', '$1[REDACTED]')
+  if (-not [string]::IsNullOrEmpty($script:tlsRuntimePassword)) { $safe = $safe.Replace($script:tlsRuntimePassword, '[REDACTED]') }
   foreach ($name in @('GAS_MQTT_PASSWORD','MQTT_PASSWORD','WIFI_PASSWORD','GAS_SYNC_TOKEN','GAS_SYNC_API_TOKEN','WOKWI_CLI_TOKEN')) {
     $secret = [Environment]::GetEnvironmentVariable($name, 'Process')
     if (-not [string]::IsNullOrEmpty($secret)) { $safe = $safe.Replace($secret, '[REDACTED]') }
@@ -703,6 +711,7 @@ function Invoke-QuickTests([switch]$ForFull) {
     $fw = Join-Path $repo 'firmware'
     $harnesses = @(
       @{ name='detector-state-machine'; file='detector_recovery_test.cpp'; sources=@('src/Detector.cpp') },
+      @{ name='flame-monitor-unit'; file='flame_monitor_test.cpp'; sources=@('src/FlameMonitor.cpp') },
       @{ name='nvs-queue-policy'; file='event_queue_policy_test.cpp'; sources=@() },
       @{ name='nvs-failure-injection'; file='event_queue_nvs_failure_test.cpp'; sources=@() },
       @{ name='ack-remove-source-regression'; file='event_ack_remove_source_test.cpp'; sources=@() },
@@ -816,7 +825,13 @@ function Wait-IsolatedWokwiRfc2217Listener([int]$Port, [string]$Marker, [int]$Ti
     try {
       $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop)
     } catch {
-      throw "Could not inspect local TCP listener state for port $Port ($($_.Exception.GetType().Name)): $($_.Exception.Message)"
+      if ($_.Exception.Message -match 'No matching MSFT_NetTCPConnection objects found by CIM query') {
+        # Get-NetTCPConnection can surface an empty result as a CIM exception.
+        # While the simulator starts, no listener is an expected state to poll.
+        $listeners = @()
+      } else {
+        throw "Could not inspect local TCP listener state for port $Port ($($_.Exception.GetType().Name)): $($_.Exception.Message)"
+      }
     }
     if ($listeners.Count -gt 0) {
       $details = [System.Collections.Generic.List[string]]::new()
@@ -891,6 +906,109 @@ function Stop-IsolatedWokwiWindow([string]$Marker, [string]$VcdPath = '') {
         $shell.SendKeys('^+w')
       }
     } catch {}
+  }
+}
+
+function New-RandomMqttPassword {
+  $bytes = New-Object byte[] 32
+  $generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $generator.GetBytes($bytes) } finally { $generator.Dispose() }
+  $encoded = [Convert]::ToBase64String($bytes)
+  return $encoded.Replace('+','-').Replace('/','_').TrimEnd([char[]]@('='))
+}
+
+function Invoke-FirmwareTlsRuntime([string]$IsolatedFirmware) {
+  $fixtureDir = Join-Path $runDir 'mqtt-tls-runtime-certificate-fixture'
+  $simDir = Join-Path $runDir ('mqtt-tls-runtime-wokwi-' + $runId)
+  $windowMarker = $null
+  $script:tlsRuntimePassword = New-RandomMqttPassword
+  try {
+    if (-not $script:python -or -not $script:pioModule) {
+      Add-Blocked 'mqtt-tls-runtime-certificate-fixture' 'mqtt-tls-runtime-certificates.log' 'Python and PlatformIO are required to create disposable TLS certificates and build the firmware runtime profile.'
+      Add-Blocked 'firmware-build-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime-build.log' 'TLS runtime build was skipped because Python or PlatformIO is unavailable.'
+      Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'TLS firmware runtime was skipped because its certificate/build prerequisites are unavailable.'
+      return
+    }
+
+    Invoke-LoggedProcess 'mqtt-tls-runtime-certificate-fixture' $script:python.Source @('tools/e2e/mqtt_security_harness.py','--write-runtime-certificates',$fixtureDir) $repo 'mqtt-tls-runtime-certificates.log' 120 'Creates a disposable test CA/server certificate fixture for one local firmware TLS session.'
+    $certificateResult = $script:tests | Where-Object { $_.name -eq 'mqtt-tls-runtime-certificate-fixture' } | Select-Object -Last 1
+    if (-not $certificateResult -or $certificateResult.status -ne 'PASS') {
+      Add-Blocked 'firmware-build-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime-build.log' 'TLS runtime firmware was not built because its disposable certificate fixture did not PASS.'
+      Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'TLS firmware runtime was skipped because its disposable certificate fixture did not PASS.'
+      return
+    }
+
+    $script:mqttCaCertPath = Join-Path $fixtureDir 'ca.pem'
+    Invoke-LoggedProcess 'firmware-build-mqtt-tls-runtime' $script:python.Source @('-m','platformio','run','-d',$IsolatedFirmware,'-e','node1_mqtt_tls_runtime') $repo 'firmware-mqtt-tls-runtime-build.log' 300 'Builds the TLS-enabled Node1 firmware with a random per-run MQTT password and disposable CA.'
+    $buildResult = $script:tests | Where-Object { $_.name -eq 'firmware-build-mqtt-tls-runtime' } | Select-Object -Last 1
+    if (-not $buildResult -or $buildResult.status -ne 'PASS') {
+      Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'TLS firmware runtime was skipped because its fresh firmware build did not PASS.'
+      return
+    }
+    if (-not $script:vsCodePath) {
+      Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'Firmware TLS runtime requires the local Wokwi VS Code simulator and its Private IoT Gateway; VS Code was not found.'
+      return
+    }
+    if (-not $script:wokwiVscodeExtensionPath -or -not (Test-Path -LiteralPath (Join-Path $script:wokwiVscodeExtensionPath 'package.json') -PathType Leaf)) {
+      Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'Firmware TLS runtime requires the Wokwi for VS Code extension; it was not found in the current user extension directory.'
+      return
+    }
+
+    New-Item -ItemType Directory -Path $simDir -Force | Out-Null
+    $runtimeDiagram = Get-Content -LiteralPath (Join-Path $IsolatedFirmware 'sim/node1/diagram.json') -Raw
+    $runtimeDiagram = Set-NvsRuntimeLogicAnalyzerTrigger -DiagramJson $runtimeDiagram
+    Write-Utf8NoBom (Join-Path $simDir 'diagram.json') $runtimeDiagram
+    $rfc2217Port = Get-FreeNvsRuntimeRfc2217Port
+    $runtimeWokwiConfig = New-NvsRuntimeWokwiConfig `
+      -FirmwareRelativePath '../isolated-source/firmware/.pio/build/node1_mqtt_tls_runtime/firmware.bin' `
+      -ElfRelativePath '../isolated-source/firmware/.pio/build/node1_mqtt_tls_runtime/firmware.elf' `
+      -Rfc2217ServerPort $rfc2217Port `
+      -VcdRelativePath 'mqtt-tls-runtime.vcd'
+    Write-Utf8NoBom (Join-Path $simDir 'wokwi.toml') $runtimeWokwiConfig
+    $windowMarker = Start-IsolatedWokwiSimulation $simDir
+    $listenerEvidence = Wait-IsolatedWokwiRfc2217Listener $rfc2217Port $windowMarker 25
+    Set-Content -LiteralPath (Join-Path $runDir 'mqtt-tls-runtime-wokwi-launch.log') -Value "PASS: started the isolated TLS firmware in a test-owned Wokwi VS Code window.`r`nRFC2217 listener: $listenerEvidence`r`nBroker endpoint is the runtime driver's loopback-only 127.0.0.1:1884 through Private IoT Gateway." -Encoding utf8
+
+    Invoke-LoggedProcess 'firmware-mqtt-tls-runtime' $script:python.Source @(
+      'tools/e2e/firmware_mqtt_tls_runtime.py',
+      '--output-dir',$runDir,
+      '--cert-dir',$fixtureDir,
+      '--serial-url',"rfc2217://127.0.0.1:$rfc2217Port",
+      '--serial-timeout','25',
+      '--runtime-timeout','40'
+    ) $repo 'firmware-mqtt-tls-runtime.log' 90 'Firmware-backed TLS runtime verifies server certificate validation, MQTT authentication, availability and telemetry through the isolated local Wokwi gateway.' -EnvironmentOverrides @{ GAS_MQTT_PASSWORD = $script:tlsRuntimePassword }
+  } catch {
+    $detail = Protect-DiagnosticText $_.Exception.Message
+    if (@($script:tests | Where-Object { $_.name -eq 'firmware-build-mqtt-tls-runtime' }).Count -eq 0) {
+      Add-Blocked 'firmware-build-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime-build.log' "Could not prepare the TLS runtime build: $detail"
+    }
+    if (@($script:tests | Where-Object { $_.name -eq 'firmware-mqtt-tls-runtime' }).Count -eq 0) {
+      Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' "Could not prepare the firmware TLS runtime: $detail"
+    }
+  } finally {
+    if ($windowMarker) {
+      try { Stop-IsolatedWokwiWindow $windowMarker } catch {
+        Set-Content -LiteralPath (Join-Path $runDir 'mqtt-tls-runtime-wokwi-stop.log') -Value (Protect-DiagnosticText $_.Exception.Message) -Encoding utf8
+      }
+    }
+    $fixtureCleanupStart = Get-Date
+    $fixtureFullPath = [System.IO.Path]::GetFullPath($fixtureDir)
+    $runDirectoryPrefix = [System.IO.Path]::GetFullPath($runDir).TrimEnd([char[]]@('\','/')) + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $fixtureFullPath.StartsWith($runDirectoryPrefix,[System.StringComparison]::OrdinalIgnoreCase)) {
+      Add-Result 'mqtt-tls-runtime-certificate-cleanup' 'BLOCKED' 127 'mqtt-tls-runtime-certificate-cleanup.log' 'Refused to remove a TLS fixture path outside the current test run directory.' $fixtureCleanupStart (Get-Date) '' $false
+    } else {
+      try {
+        if (Test-Path -LiteralPath $fixtureFullPath -PathType Container) { Remove-Item -LiteralPath $fixtureFullPath -Recurse -Force }
+        Set-Content -LiteralPath (Join-Path $runDir 'mqtt-tls-runtime-certificate-cleanup.log') -Value 'PASS: disposable TLS server key and certificate fixture removed after the build/runtime.' -Encoding utf8
+        Add-Result 'mqtt-tls-runtime-certificate-cleanup' 'PASS' 0 'mqtt-tls-runtime-certificate-cleanup.log' 'Disposable TLS private keys were removed from the test run directory.' $fixtureCleanupStart (Get-Date) '' $false
+      } catch {
+        $cleanupDetail = Protect-DiagnosticText $_.Exception.Message
+        Set-Content -LiteralPath (Join-Path $runDir 'mqtt-tls-runtime-certificate-cleanup.log') -Value "BLOCKED: could not remove disposable TLS certificate fixture. $cleanupDetail" -Encoding utf8
+        Add-Result 'mqtt-tls-runtime-certificate-cleanup' 'BLOCKED' 127 'mqtt-tls-runtime-certificate-cleanup.log' 'Disposable TLS private key cleanup could not be confirmed.' $fixtureCleanupStart (Get-Date) '' $false
+      }
+    }
+    $script:tlsRuntimePassword = $null
+    $script:mqttCaCertPath = $null
   }
 }
 
@@ -1019,6 +1137,35 @@ function Invoke-FullTests {
       foreach ($node in @('node1','node2','node3')) { Add-Blocked ('wokwi-' + $node) ('wokwi-' + $node + '.log') 'Firmware build result is unavailable; scenario was not run.' }
     }
 
+    $flameScenarioName = 'wokwi-node1-flame'
+    $flameVcd = Join-Path $runDir 'node1-flame-gpio.vcd'
+    $flameSerial = Join-Path $runDir 'node1-flame-serial.log'
+    if ($buildResult -and $buildResult.status -eq 'PASS' -and $artifactResult -and $artifactResult.status -eq 'PASS' -and $script:wokwiPath -and $script:wokwiTokenPresent) {
+      $flameSimDir = Join-Path $isolatedFirmware 'sim/node1'
+      $flameScenario = 'scenarios/flame.yaml'
+      if (Test-Path -LiteralPath (Join-Path $flameSimDir $flameScenario) -PathType Leaf) {
+        Invoke-WokwiNodeScenarioWithRetry $flameScenarioName $script:wokwiPath @($flameSimDir,'--scenario',$flameScenario,'--timeout','60000','--timeout-exit-code','124','--serial-log-file',$flameSerial,'--vcd-file',$flameVcd) $repo ($flameScenarioName + '.log') 180 'Node1 F1/F2 flame monitoring and overlapping gas alarm scenario.'
+        $flameResult = $script:tests | Where-Object { $_.name -eq $flameScenarioName } | Select-Object -Last 1
+        if ($flameResult -and $flameResult.status -eq 'PASS') {
+          Invoke-LoggedProcess 'wokwi-node1-flame-gpio-vcd' $script:python.Source @('tools/verify_wokwi_vcd.py',$flameVcd) $repo 'wokwi-node1-flame-gpio-vcd.log' 30 'F1/F2 scenario output pin capture and buzzer activity.'
+        } else {
+          Add-Blocked 'wokwi-node1-flame-gpio-vcd' 'wokwi-node1-flame-gpio-vcd.log' 'F1/F2 scenario did not pass, so its GPIO VCD was not accepted.'
+        }
+      } else {
+        Add-Blocked $flameScenarioName ($flameScenarioName + '.log') 'Node1 flame scenario is missing from the isolated project copy.'
+        Add-Blocked 'wokwi-node1-flame-gpio-vcd' 'wokwi-node1-flame-gpio-vcd.log' 'Node1 flame scenario was unavailable.'
+      }
+    } elseif (-not $buildResult -or $buildResult.status -ne 'PASS') {
+      Add-Blocked $flameScenarioName ($flameScenarioName + '.log') 'F1/F2 Wokwi scenario skipped because the fresh firmware build did not PASS.'
+      Add-Blocked 'wokwi-node1-flame-gpio-vcd' 'wokwi-node1-flame-gpio-vcd.log' 'Fresh firmware build did not PASS.'
+    } elseif (-not $artifactResult -or $artifactResult.status -ne 'PASS') {
+      Add-Blocked $flameScenarioName ($flameScenarioName + '.log') 'F1/F2 Wokwi scenario skipped because firmware artifact validation did not PASS.'
+      Add-Blocked 'wokwi-node1-flame-gpio-vcd' 'wokwi-node1-flame-gpio-vcd.log' 'Firmware artifact validation did not PASS.'
+    } elseif (-not $script:wokwiPath -or -not $script:wokwiTokenPresent) {
+      Add-Blocked $flameScenarioName ($flameScenarioName + '.log') 'Wokwi CLI or token is unavailable for the F1/F2 scenario.'
+      Add-Blocked 'wokwi-node1-flame-gpio-vcd' 'wokwi-node1-flame-gpio-vcd.log' 'Wokwi runtime prerequisites are unavailable.'
+    }
+
     $faultScenarioName = 'wokwi-node3-sensor-faults'
     $faultVcd = Join-Path $runDir 'node3-sensor-faults-gpio.vcd'
     $faultSerial = Join-Path $runDir 'node3-sensor-faults-serial.log'
@@ -1070,7 +1217,7 @@ function Invoke-FullTests {
     } else {
       Add-Blocked 'firmware-build-mqtt-tls-compile' 'firmware-mqtt-tls-build.log' 'Compile-only TLS profile was skipped because the CA fixture, PlatformIO, or direct Xtensa compiler preflight did not PASS.'
     }
-    Add-Blocked 'firmware-mqtt-tls-runtime' 'firmware-mqtt-tls-runtime.log' 'TLS firmware runtime was not run: this target is compile-only and no firmware-backed TLS broker session is configured in this runner.'
+    Invoke-FirmwareTlsRuntime $isolatedFirmware
     if ($script:python -and $script:mosquitto -and $script:mosquittoPasswd -and
         (Test-Path -LiteralPath $script:mosquitto.Source -PathType Leaf) -and
         (Test-Path -LiteralPath $script:mosquittoPasswd.Source -PathType Leaf)) {
@@ -1111,7 +1258,9 @@ function Invoke-FullTests {
       $artifactMessage = "PASS: fresh NVS runtime BIN/ELF exist under this run's isolated .pio tree."
       Set-Content -LiteralPath (Join-Path $runDir 'nvs-runtime-artifact-validation.log') -Value $artifactMessage -Encoding utf8
       Add-Result 'nvs-runtime-artifact-validation' 'PASS' 0 'nvs-runtime-artifact-validation.log' $artifactMessage $artifactStart (Get-Date) '' $false
-      $runtimeSimDir = Join-Path $runDir 'nvs-runtime-wokwi'
+      # Include the run id in the window title marker so a stale test-owned
+      # VS Code window from an older run cannot block this run's simulator.
+      $runtimeSimDir = Join-Path $runDir ('nvs-runtime-wokwi-' + $runId)
       try {
         New-Item -ItemType Directory -Path $runtimeSimDir -Force | Out-Null
         $runtimeDiagram = Get-Content -LiteralPath (Join-Path $isolatedFirmware 'sim/node1/diagram.json') -Raw

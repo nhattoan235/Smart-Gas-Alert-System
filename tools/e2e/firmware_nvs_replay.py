@@ -1369,6 +1369,17 @@ def run_runtime(args: argparse.Namespace) -> int:
         except Blocked:
             raise
         log.write("wokwi_local_serial_attached", detail=args.serial_url)
+        # Opening the Wokwi RFC2217 endpoint can complete before the simulated
+        # ESP32 has finished booting. Commands sent during that window are lost
+        # because setup has not reached the test command poller yet. Wait for
+        # the application's startup banner before the first STATUS request.
+        _, startup_banner = monitor.wait_line(
+            lambda item: item.startswith(f"{DEVICE_ID} starting:"),
+            args.serial_timeout,
+            "firmware startup banner before the first NVS test command",
+        )
+        log.write("firmware_startup_ready", device_id=DEVICE_ID,
+                  detail=startup_banner[:240])
         initial, startup_snapshot = capture_startup_queue_snapshot(monitor, log)
         startup_queue_count = validate_startup_status(initial)
         if startup_snapshot["queue_count"] != startup_queue_count:

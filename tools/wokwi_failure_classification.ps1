@@ -26,7 +26,7 @@ function Test-WokwiTransportRetryEligible {
   )
 
   return ($Attempt -eq 1 -and
-    $TestName -match '^wokwi-node[123]$' -and
+    $TestName -match '^wokwi-node[123](-sensor-faults)?$' -and
     $Status -eq 'BLOCKED' -and
     $ExitCode -eq 77 -and
     $ProcessOutput -match '(?im)^\s*API Error:\s*Connection to transport closed unexpectedly:\s*code 1006\s*$')

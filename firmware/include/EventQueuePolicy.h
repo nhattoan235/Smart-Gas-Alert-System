@@ -7,6 +7,10 @@ namespace event_queue_policy {
 
 inline int priority(const char *data) {
   if (!data) return 1;
+  if (strstr(data, "\"flame_active\":true") != nullptr) {
+    if (strstr(data, "\"flame_severity\":\"DANGER\"") != nullptr) return 5;
+    if (strstr(data, "\"flame_severity\":\"FAULT\"") != nullptr) return 4;
+  }
   if (strstr(data, "\"state\":\"DANGER\"") != nullptr) return 5;
   if (strstr(data, "\"state\":\"FAULT\"") != nullptr) return 4;
   if (strstr(data, "\"state\":\"WARNING\"") != nullptr) return 3;

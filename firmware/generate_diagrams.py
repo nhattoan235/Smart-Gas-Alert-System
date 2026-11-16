@@ -53,6 +53,14 @@ def diagram(node):
         wires.extend([[f"{ident}:2", f"esp:{gpio}", "green", []],
                       [f"{ident}:1", "esp:GND.2", "black", []],
                       [f"{ident}:3", "esp:3V3.2", "red", []]])
+    if node == "node1":
+        for ident, gpio, top, color, label in (("f1", "38", 485, "red", "F1 FLAME"),
+                                               ("f2", "40", 555, "yellow", "F2 FLAME BURNER 1"),
+                                               ("burner1Gas", "41", 625, "green", "BURNER 1 GAS ON")):
+            parts.append(part("wokwi-pushbutton", ident, top, 525,
+                              color=color, label=label))
+            wires.extend([[f"{ident}:1.l", f"esp:{gpio}", "green", []],
+                          [f"{ident}:2.l", "esp:GND.2", "black", []]])
     return {"version": 1, "author": "Gas Sentinel", "editor": "wokwi",
             "parts": parts, "connections": wires}
 

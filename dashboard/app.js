@@ -134,6 +134,9 @@ function renderZones() {
     const switchText = node.online && 'valve_open_sim' in data
       ? `Công tắc giả lập: van ${data.valve_open_sim ? 'mở' : 'đóng'}, bếp ${data.stove_on_sim ? 'bật' : 'tắt'}`
       : 'Chưa có dữ liệu công tắc';
+    const flameText = ['f1_flame', 'f2_flame', 'burner1_gas_state', 'f2_state'].some(key => key in data)
+      ? `F1 ${data.f1_flame == null ? 'chưa rõ' : data.f1_flame ? 'phát hiện lửa' : 'không phát hiện'} · F2 ${data.f2_flame == null ? 'chưa rõ' : data.f2_flame ? 'có lửa' : 'không có lửa'} · gas đầu đốt 1 ${data.burner1_gas_state == null ? 'chưa rõ' : data.burner1_gas_state ? 'đang cấp' : 'đã ngắt'}${data.f2_state ? ` · ${escapeHtml(data.f2_state)}` : ''}`
+      : '';
     const gasRow = (key, label) => {
       const gas = current ? data[key] : null;
       const width = gas ? Math.max(0, Math.min(100, Number(gas.signal_pct))) : 0;
@@ -148,7 +151,7 @@ function renderZones() {
         </div>
         <div class="gas-grid mt-4">${gasRow('lpg', 'LPG')}${gasRow('co', 'CO')}</div>
         <div class="zone-info mt-4"><div><div class="info-label">Nhiệt độ</div><strong class="info-value">${current ? `${n1(data.temperature_c)} °C` : '—'}</strong></div><div><div class="info-label">Độ ẩm</div><strong class="info-value">${current ? `${n1(data.humidity_pct)} %RH` : '—'}</strong></div></div>
-        <div class="zone-foot"><div>${node.online ? `Mẫu mới ${Math.round(node.age_s ?? 0)} giây trước` : 'Không có dữ liệu mới từ nút'}</div><div>${escapeHtml(distance)}</div><div>${escapeHtml(switchText)}</div>${Number.isFinite(data.lpg_truth_sim_pct) ? `<div>Kịch bản: nguồn LPG ${n1(data.lpg_truth_sim_pct)}%, núm nhiễu ${Number(data.interference_sim_pct)>=0?'+':''}${n1(data.interference_sim_pct)}%, môi trường ${Number(data.environment_bias_sim_pct)>=0?'+':''}${n1(data.environment_bias_sim_pct)}%</div>` : ''}${typeof data.lpg_leak_truth_sim === 'boolean' ? `<div>Nhãn kiểm thử: LPG ${data.lpg_leak_truth_sim ? 'có rò' : 'không rò'}, CO ${data.co_hazard_truth_sim ? 'có nguy cơ' : 'không nguy cơ'}</div>` : ''}${node.valve_reminder ? '<div class="text-warning-emphasis fw-bold">Nhắc kiểm tra: van giả lập đang mở, bếp tắt trên 2 phút.</div>' : ''}${data.inspection_required ? '<div class="text-danger fw-bold">Cần kiểm tra hiện trường rồi nhấn INSPECTED tại bo.</div>' : ''}${Number(data.lost_events)>0 ? `<div class="text-danger fw-bold">Đã mất ${Number(data.lost_events)} sự kiện khi bộ đệm đầy.</div>` : ''}</div>
+        <div class="zone-foot"><div>${node.online ? `Mẫu mới ${Math.round(node.age_s ?? 0)} giây trước` : 'Không có dữ liệu mới từ nút'}</div><div>${escapeHtml(distance)}</div><div>${escapeHtml(switchText)}</div>${flameText ? `<div>${flameText}</div>` : ''}${Number.isFinite(data.lpg_truth_sim_pct) ? `<div>Kịch bản: nguồn LPG ${n1(data.lpg_truth_sim_pct)}%, núm nhiễu ${Number(data.interference_sim_pct)>=0?'+':''}${n1(data.interference_sim_pct)}%, môi trường ${Number(data.environment_bias_sim_pct)>=0?'+':''}${n1(data.environment_bias_sim_pct)}%</div>` : ''}${typeof data.lpg_leak_truth_sim === 'boolean' ? `<div>Nhãn kiểm thử: LPG ${data.lpg_leak_truth_sim ? 'có rò' : 'không rò'}, CO ${data.co_hazard_truth_sim ? 'có nguy cơ' : 'không nguy cơ'}</div>` : ''}${node.valve_reminder ? '<div class="text-warning-emphasis fw-bold">Nhắc kiểm tra: van giả lập đang mở, bếp tắt trên 2 phút.</div>' : ''}${data.inspection_required ? '<div class="text-danger fw-bold">Cần kiểm tra hiện trường rồi nhấn INSPECTED tại bo.</div>' : ''}${Number(data.lost_events)>0 ? `<div class="text-danger fw-bold">Đã mất ${Number(data.lost_events)} sự kiện khi bộ đệm đầy.</div>` : ''}</div>
       </div></article></div>`;
   }).join('');
 }
@@ -218,9 +221,11 @@ function renderCharts() {
 }
 
 function renderEvents() {
-  const rows = filterAbnormal ? model.events.filter(event => abnormal.has(event.state)) : model.events;
+  const rows = filterAbnormal ? model.events.filter(event => abnormal.has(event.state) || event.flame_active === true) : model.events;
   $('eventRows').innerHTML = rows.length ? rows.map(event => {
-    const state = stateNames[event.state] ? event.state : 'OFFLINE';
+    const state = event.flame_active === true ? (event.flame_severity === 'FAULT' ? 'FAULT' : 'DANGER') : stateNames[event.state] ? event.state : 'OFFLINE';
+    const flameLabels = { F1_FIRE: 'Phát hiện lửa quanh bình', F1_SENSOR_FAULT: 'Lỗi cảm biến lửa quanh bình', F2_IGNITION_TIMEOUT: 'Chưa xác nhận lửa sau khi cấp gas', F2_FLAME_LOST: 'Nghi mất lửa khi vẫn cấp gas', F2_STARTUP_UNCONFIRMED: 'Chưa xác nhận lửa sau khi khởi động', F2_SENSOR_FAULT: 'Lỗi cảm biến lửa', F2_GAS_STATE_FAULT: 'Lỗi tín hiệu cấp gas' };
+    const flame = event.flame_channel ? `${event.flame_channel}${event.burner_id ? ' · đầu đốt số 1' : ' · quanh bình'}: ${flameLabels[event.flame_cause] ?? 'Sự kiện lửa'}${event.flame_active ? '' : ' · đã kết thúc'}` : '';
     const changed = event.changed_gas === 'CO' ? ['CO'] : event.changed_gas === 'BOTH' ? ['LPG', 'CO'] : event.changed_gas === 'LPG' ? ['LPG'] : [];
     const gasStates = changed.map(gas => `${gas}: ${stateNames[event[gas.toLowerCase()]?.state] ?? '—'}`).join(' · ');
     const rises = changed.map(gas => {
@@ -229,9 +234,9 @@ function renderEvents() {
     }).filter(Boolean).join(' · ');
     return `<tr class="log-row-${state.toLowerCase()}">
       <td class="log-time">${stamp(event.time)}</td>
-      <td><strong>${escapeHtml(names[event.device_id] ?? event.device_id)}</strong><div class="small text-secondary">${escapeHtml(event.changed_gas === 'BOTH' ? 'LPG + CO' : event.changed_gas === 'NONE' ? 'Thao tác tại bo' : event.changed_gas)}</div></td>
+      <td><strong>${escapeHtml(names[event.device_id] ?? event.device_id)}</strong><div class="small text-secondary">${escapeHtml(flame || (event.changed_gas === 'BOTH' ? 'LPG + CO' : event.changed_gas === 'NONE' ? 'Thao tác tại bo' : event.changed_gas))}</div></td>
       <td>${badge(state)}${gasStates ? `<div class="small text-secondary mt-1">${escapeHtml(gasStates)}</div>` : ''}</td>
-      <td><strong>LPG ${n1(event.lpg?.signal_pct)}% · CO ${n1(event.co?.signal_pct)}%</strong>${rises ? `<div class="small text-secondary">${escapeHtml(rises)}</div>` : ''}</td>
+      <td>${flame ? `<strong>${event.flame_active ? 'Đang có cảnh báo' : 'Sự kiện đã đóng'}</strong>` : `<strong>LPG ${n1(event.lpg?.signal_pct)}% · CO ${n1(event.co?.signal_pct)}%</strong>${rises ? `<div class="small text-secondary">${escapeHtml(rises)}</div>` : ''}`}</td>
       <td class="action-text">${event.action ? escapeHtml(recordedActions[event.action] ?? 'Thao tác chưa biết') : `${escapeHtml(actions[state] ?? 'Theo dõi')}${state === 'OFFLINE' ? '' : ' (theo logic bo)'}`}</td>
     </tr>`;
   }).join('') : `<tr><td colspan="5" class="text-center text-secondary py-4">${filterAbnormal ? 'Không có sự kiện bất thường trong nhật ký gần đây.' : 'Chưa có sự kiện. Khi nút đổi trạng thái, log sẽ xuất hiện ở đây.'}</td></tr>`;
@@ -242,7 +247,8 @@ function renderIncidents() {
     const open = item.closed_at == null;
     const acknowledged = item.ack_at != null;
     const escalated = item.escalated_at != null;
-    return `<tr class="${open && escalated ? 'log-row-danger' : ''}"><td>${stamp(new Date(item.opened_at * 1000))}</td><td>${escapeHtml(names[item.device_id] ?? item.device_id)} · ${escapeHtml(item.gas.toUpperCase())}</td><td>${badge(item.state)}</td><td>${open ? acknowledged ? 'Đã xác nhận trên web' : escalated ? 'Quá hạn xác nhận — cần xử lý' : 'Chờ xác nhận' : 'Đã kết thúc'}</td><td>${open && !acknowledged ? `<button type="button" class="btn btn-sm btn-outline-primary" data-ack-id="${Number(item.id)}">Xác nhận đã xem</button>` : '—'}</td></tr>`;
+    const source = item.gas === 'flame' ? `${item.channel ?? 'Lửa'} · ${item.cause ?? 'cảnh báo'}` : item.gas.toUpperCase();
+    return `<tr class="${open && escalated ? 'log-row-danger' : ''}"><td>${stamp(new Date(item.opened_at * 1000))}</td><td>${escapeHtml(names[item.device_id] ?? item.device_id)} · ${escapeHtml(source)}</td><td>${badge(item.state)}</td><td>${open ? acknowledged ? 'Đã xác nhận trên web' : escalated ? 'Quá hạn xác nhận — cần xử lý' : 'Chờ xác nhận' : 'Đã kết thúc'}</td><td>${open && !acknowledged ? `<button type="button" class="btn btn-sm btn-outline-primary" data-ack-id="${Number(item.id)}">Xác nhận đã xem</button>` : '—'}</td></tr>`;
   }).join('') : '<tr><td colspan="5" class="text-center text-secondary py-4">Chưa có sự cố cần xác nhận.</td></tr>';
 }
 function renderIntegrationStatus() {

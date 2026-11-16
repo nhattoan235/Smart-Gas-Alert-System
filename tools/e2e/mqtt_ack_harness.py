@@ -360,6 +360,13 @@ def stop_child(process: subprocess.Popen | None) -> None:
         process.wait(timeout=3)
 
 
+def capture_process_output(stream, chunks: list[str]) -> None:
+    try:
+        chunks.append(stream.read())
+    except (OSError, ValueError):
+        pass
+
+
 def run_harness() -> None:
     global PORT
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_check:
@@ -378,21 +385,26 @@ def run_harness() -> None:
 
     broker_proc = backend_proc = None
     publisher = ack_subscriber = None
+    broker_output: list[str] = []
+    broker_output_reader = None
     temp_root = Path(os.environ.get("GAS_E2E_TMPDIR", tempfile.gettempdir()))
     temp_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="mqtt-ack-", dir=temp_root) as temp_name:
         temp = Path(temp_name)
         db_path = temp / "harness.sqlite3"
         ready_file = temp / "broker.ready"
-        broker_log = temp / "broker.log"
         backend_log = temp / "backend.log"
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            with broker_log.open("w", encoding="utf-8") as output:
-                broker_proc = subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), "--broker", str(ready_file), str(PORT)],
-                    cwd=REPO, stdout=output, stderr=subprocess.STDOUT, creationflags=creationflags,
-                )
+            broker_proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--broker", str(ready_file), str(PORT)],
+                cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", creationflags=creationflags,
+            )
+            broker_output_reader = threading.Thread(
+                target=capture_process_output, args=(broker_proc.stdout, broker_output), daemon=True,
+            )
+            broker_output_reader.start()
             wait_for(lambda: ready_file.exists(), broker_proc, 5, "isolated broker startup")
 
             backend_env = os.environ.copy()
@@ -483,7 +495,7 @@ def run_harness() -> None:
             print(f"PASS: isolated MQTT/backend harness completed on loopback port={PORT} (1884 preferred)", flush=True)
         except Exception as exc:
             backend_tail = backend_log.read_text(encoding="utf-8", errors="replace")[-6000:] if backend_log.exists() else ""
-            broker_tail = broker_log.read_text(encoding="utf-8", errors="replace")[-2000:] if broker_log.exists() else ""
+            broker_tail = "".join(broker_output)[-2000:]
             raise RuntimeError(f"{exc}\n--- backend log tail ---\n{backend_tail}\n--- broker log tail ---\n{broker_tail}") from exc
         finally:
             for client in (publisher, ack_subscriber):
@@ -494,6 +506,10 @@ def run_harness() -> None:
                         pass
             stop_child(backend_proc)
             stop_child(broker_proc)
+            if broker_output_reader is not None:
+                broker_output_reader.join(timeout=3)
+            if broker_proc is not None and broker_proc.stdout is not None:
+                broker_proc.stdout.close()
 
 
 def main() -> int:

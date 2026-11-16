@@ -19,6 +19,7 @@ SUPPORTED_CONTROLS = {
     "humid": {"position"}, "interference": {"position"},
     "lpgFault": {"pressed"}, "coFault": {"pressed"},
     "ack": {"pressed"}, "inspect": {"pressed"},
+    "f1": {"pressed"}, "f2": {"pressed"}, "burner1Gas": {"pressed"},
 }
 
 
@@ -61,6 +62,8 @@ def validate_scenarios(root: Path = ROOT) -> tuple[int, list[str]]:
                     )
                     if control == "position":
                         assert 0 <= float(value["value"]) <= 1, f"{scenario_path}: pot out of range"
+                    elif control == "pressed":
+                        assert value["value"] in (0, 1), f"{scenario_path}: button state must be 0 or 1"
                     assertions += 1
                 elif action == "expect-pin":
                     part_id = value["part-id"]
@@ -71,7 +74,12 @@ def validate_scenarios(root: Path = ROOT) -> tuple[int, list[str]]:
                     assertions += 1
                 elif action == "wait-serial":
                     assert isinstance(value, str) and value.strip(), f"{scenario_path}: empty serial assertion"
-                    if value.startswith(f"{node}:"):
+                    if value.startswith("flame_event "):
+                        assert "channel=F" in value and "cause=" in value and "active=" in value, (
+                            f"{scenario_path}: malformed flame event assertion {value!r}"
+                        )
+                        assertions += 1
+                    elif value.startswith(f"{node}:"):
                         assert value.startswith(f"{node}: LPG "), (
                             f"{scenario_path}: firmware prefixes transition lines with '{node}: LPG'; got {value!r}"
                         )

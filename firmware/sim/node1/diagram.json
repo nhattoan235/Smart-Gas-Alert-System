@@ -259,6 +259,36 @@
       "top": 410,
       "left": 525,
       "attrs": {}
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "f1",
+      "top": 485,
+      "left": 525,
+      "attrs": {
+        "color": "red",
+        "label": "F1 FLAME"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "f2",
+      "top": 555,
+      "left": 525,
+      "attrs": {
+        "color": "yellow",
+        "label": "F2 FLAME BURNER 1"
+      }
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "burner1Gas",
+      "top": 625,
+      "left": 525,
+      "attrs": {
+        "color": "green",
+        "label": "BURNER 1 GAS ON"
+      }
     }
   ],
   "connections": [
@@ -530,6 +560,42 @@
       "coTruth:3",
       "esp:3V3.2",
       "red",
+      []
+    ],
+    [
+      "f1:1.l",
+      "esp:38",
+      "green",
+      []
+    ],
+    [
+      "f1:2.l",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "f2:1.l",
+      "esp:40",
+      "green",
+      []
+    ],
+    [
+      "f2:2.l",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "burner1Gas:1.l",
+      "esp:41",
+      "green",
+      []
+    ],
+    [
+      "burner1Gas:2.l",
+      "esp:GND.2",
+      "black",
       []
     ]
   ]

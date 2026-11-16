@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import unittest
+import configparser
 from pathlib import Path
 
 from tools.validate_wokwi_artifacts import ArtifactValidationError, validate_artifacts
@@ -23,6 +24,7 @@ class WokwiArtifactValidationTests(unittest.TestCase):
         firmware = self.project / "firmware"
         (firmware / "src").mkdir(parents=True)
         shutil.copy2(PROJECT_ROOT / "firmware" / "src" / "main.cpp", firmware / "src" / "main.cpp")
+        shutil.copy2(PROJECT_ROOT / "firmware" / "platformio.ini", firmware / "platformio.ini")
         for node in NODES:
             source = PROJECT_ROOT / "firmware" / "sim" / node
             target = firmware / "sim" / node
@@ -55,6 +57,21 @@ class WokwiArtifactValidationTests(unittest.TestCase):
         assertions, summaries = validate_scenarios(self.project)
         self.assertGreater(assertions, 56)
         self.assertTrue(any("sensor-faults.yaml" in line for line in summaries))
+
+    def test_flame_monitor_is_enabled_only_for_node1_profiles(self) -> None:
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(self.project / "firmware" / "platformio.ini", encoding="utf-8")
+        for profile in (
+            "env:node1",
+            "env:node1_nvs_runtime",
+            "env:node1_mqtt_tls_compile",
+            "env:node1_mqtt_tls_runtime",
+        ):
+            with self.subTest(profile=profile):
+                self.assertIn("-D FLAME_MONITOR_ENABLED=1", config[profile]["build_flags"])
+        for profile in ("env:node2", "env:node3", "env:n8r8_hardware"):
+            with self.subTest(profile=profile):
+                self.assertNotIn("FLAME_MONITOR_ENABLED=1", config[profile]["build_flags"])
 
     def test_artifact_validation_fails_when_outputs_are_absent(self) -> None:
         with self.assertRaisesRegex(ArtifactValidationError, "artifact is missing"):

@@ -60,6 +60,19 @@ class MqttSecuritySourceTests(unittest.TestCase):
         self.assertIn('line.startswith("MQTT connected: ")', runtime)
         self.assertIn('"home/{HOME}/device/{DEVICE}/telemetry" in topics', runtime)
 
+    def test_full_runner_builds_and_runs_firmware_tls_runtime(self) -> None:
+        runner = read("tools/run-all-tests.ps1")
+        self.assertIn("Invoke-LoggedProcess 'firmware-build-mqtt-tls-runtime'", runner)
+        self.assertIn("tools/e2e/firmware_mqtt_tls_runtime.py", runner)
+        self.assertIn("tlsRuntimePassword = New-RandomMqttPassword", runner)
+        self.assertNotIn("this target is compile-only and no firmware-backed TLS broker session is configured", runner)
+        runtime_function = re.search(
+            r"(?ms)^function Invoke-FirmwareTlsRuntime\(.*?(?=^function |\Z)", runner
+        )
+        self.assertIsNotNone(runtime_function)
+        self.assertIn("Set-NvsRuntimeLogicAnalyzerTrigger", runtime_function.group(0))
+        self.assertIn("New-NvsRuntimeWokwiConfig", runtime_function.group(0))
+
     def test_mosquitto_adapter_uses_loopback_and_ephemeral_credentials(self) -> None:
         runtime = read("tools/e2e/mosquitto_security_runtime.py")
         self.assertIn('sock.bind(("127.0.0.1", 0))', runtime)

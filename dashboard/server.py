@@ -186,6 +186,10 @@ def init_db() -> None:
         for name, sql_type in migrations.items():
             if name not in columns:
                 con.execute(f"ALTER TABLE messages ADD COLUMN {name} {sql_type}")
+        incident_columns = {row["name"] for row in con.execute("PRAGMA table_info(incidents)")}
+        for name in ("channel", "cause"):
+            if name not in incident_columns:
+                con.execute(f"ALTER TABLE incidents ADD COLUMN {name} TEXT")
         sync_columns = {row["name"] for row in con.execute("PRAGMA table_info(sync_received)")}
         if "payload_hash" not in sync_columns:
             con.execute("ALTER TABLE sync_received ADD COLUMN payload_hash TEXT NOT NULL DEFAULT ''")
@@ -241,6 +245,25 @@ def validate(topic: str, data: dict) -> bool:
     expected = max((data["lpg"]["state"], data["co"]["state"]), key=SEVERITY.get)
     if data["state"] != expected or data.get("changed_gas") not in {"NONE", "LPG", "CO", "BOTH"}:
         return False
+    flame_fields = {"flame_channel", "flame_cause", "flame_active", "burner_id"}
+    present_flame_fields = flame_fields.intersection(data)
+    if present_flame_fields:
+        if bits[4] != "event" or not {"flame_channel", "flame_cause", "flame_active"}.issubset(data):
+            return False
+        channel, cause = data["flame_channel"], data["flame_cause"]
+        causes = {"F1": {"F1_FIRE", "F1_SENSOR_FAULT"}, "F2": {
+            "F2_IGNITION_TIMEOUT", "F2_FLAME_LOST", "F2_STARTUP_UNCONFIRMED",
+            "F2_SENSOR_FAULT", "F2_GAS_STATE_FAULT"}}
+        if not isinstance(channel, str) or not isinstance(cause, str):
+            return False
+        if channel not in causes or cause not in causes[channel] or type(data["flame_active"]) is not bool:
+            return False
+        if "flame_severity" in data and (not isinstance(data["flame_severity"], str) or data["flame_severity"] not in {"DANGER", "FAULT"}):
+            return False
+        if channel == "F2" and data.get("burner_id") != "burner1":
+            return False
+        if channel == "F1" and "burner_id" in data:
+            return False
     if data.get("action", "") not in {"", "MUTE_30S", "ACK_DENIED_DANGER", "INSPECTION_CONFIRMED"}:
         return False
     for key, lo, hi in (("temperature_c", -40, 125), ("humidity_pct", 0, 100)):
@@ -258,6 +281,11 @@ def validate(topic: str, data: dict) -> bool:
     for key in ("valve_open_sim", "stove_on_sim"):
         if key in data and type(data[key]) is not bool:
             return False
+    for key in ("f1_flame", "f2_flame", "burner1_gas_state"):
+        if key in data and data[key] is not None and type(data[key]) is not bool:
+            return False
+    if "f2_state" in data and (not isinstance(data["f2_state"], str) or len(data["f2_state"]) > 32):
+        return False
     if "lost_events" in data and (type(data["lost_events"]) is not int or not 0 <= data["lost_events"] < 2**32):
         return False
     return type(data.get("simulated")) is bool
@@ -271,6 +299,16 @@ def _store_message(con: sqlite3.Connection, data: dict, now: float, received_at:
     if cur.rowcount != 1:
         return False
     if data["kind"] == "event":
+        if "flame_channel" in data:
+            channel, cause = data["flame_channel"], data["flame_cause"]
+            existing = con.execute("SELECT id FROM incidents WHERE device_id=? AND gas='flame' AND channel=? AND cause=? AND closed_at IS NULL ORDER BY id DESC LIMIT 1",
+                                   (data["device_id"], channel, cause)).fetchone()
+            if data["flame_active"] and not existing:
+                state = data.get("flame_severity", "FAULT" if cause.endswith("FAULT") else "DANGER")
+                con.execute("INSERT INTO incidents(device_id,gas,opened_at,opened_boot_id,opened_seq,state,channel,cause) VALUES(?,?,?,?,?,?,?,?)",
+                            (data["device_id"], "flame", now, data["boot_id"], data["seq"], state, channel, cause))
+            elif not data["flame_active"] and existing:
+                con.execute("UPDATE incidents SET closed_at=? WHERE id=?", (now, existing["id"]))
         for gas in ("lpg", "co"):
             if data["changed_gas"] not in (gas.upper(), "BOTH"):
                 continue
@@ -565,7 +603,7 @@ def queue_expired_notifications(now: float | None = None) -> int:
     deadline = now - ESCALATE_AFTER_S
     queued = 0
     with db() as con:
-        due = con.execute("SELECT * FROM incidents WHERE closed_at IS NULL AND ack_at IS NULL AND escalated_at IS NULL AND opened_at<=?",
+        due = con.execute("SELECT * FROM incidents WHERE gas!='flame' AND closed_at IS NULL AND ack_at IS NULL AND escalated_at IS NULL AND opened_at<=?",
                           (deadline,)).fetchall()
         for incident in due:
             con.execute("UPDATE incidents SET escalated_at=? WHERE id=? AND escalated_at IS NULL AND ack_at IS NULL AND closed_at IS NULL",

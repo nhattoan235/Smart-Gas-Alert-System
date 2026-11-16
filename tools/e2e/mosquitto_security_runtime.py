@@ -112,7 +112,7 @@ def run(args: argparse.Namespace) -> int:
     import json
     from datetime import datetime, timezone
 
-    output = Path(args.output_dir)
+    output = Path(args.output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
     live_log = output / "mqtt-security-mosquitto-live.jsonl"
 
@@ -134,7 +134,8 @@ def run(args: argparse.Namespace) -> int:
         "node1-test": secrets.token_urlsafe(32),
         "gateway-test": secrets.token_urlsafe(32),
     }
-    temp_root = Path(os.environ.get("GAS_E2E_TMPDIR", str(output / "temp")))
+    configured_temp_root = os.environ.get("GAS_E2E_TMPDIR")
+    temp_root = Path(configured_temp_root).resolve() if configured_temp_root else output / "temp"
     temp_root.mkdir(parents=True, exist_ok=True)
     process = None
     broker_log_copy = output / "mosquitto-broker.log"
@@ -192,8 +193,31 @@ def run(args: argparse.Namespace) -> int:
             if own not in (0, 1):
                 raise AssertionError("Mosquitto denied node subscription to its own application ACK")
             other = security.subscribe(node, "home/security-test/device/node2/ack")
-            if other != 0x80:
-                raise AssertionError(f"Mosquitto ACL did not deny cross-device ACK subscription: SUBACK={other:#x}")
+            if other not in (0, 1, 0x80):
+                raise AssertionError(f"Mosquitto returned an invalid cross-device ACK SUBACK: {other:#x}")
+
+            gateway, rc = security.mqtt_client(
+                port, trusted, "gateway-test", credentials["gateway-test"],
+                client_id="gateway-cross-device-probe",
+            )
+            if rc != 0:
+                raise AssertionError(f"Mosquitto rejected valid gateway credentials with CONNACK {rc}")
+            cross_device_ack = "home/security-test/device/node2/ack"
+            cross_publish = security.publish_qos1(gateway, cross_device_ack, "cross-device-probe")
+            if cross_publish != 1:
+                raise AssertionError("Mosquitto denied the gateway's permitted cross-device ACK publish")
+            previous_timeout = node.gettimeout()
+            node.settimeout(0.5)
+            try:
+                leaked = security.receive_publish(node)
+            except TimeoutError:
+                leaked = None
+            finally:
+                node.settimeout(previous_timeout)
+            if leaked is not None:
+                raise AssertionError(
+                    f"Mosquitto delivered a cross-device ACK to node1 despite its read ACL: {leaked!r}"
+                )
             allowed = security.publish_qos1(node, "home/security-test/device/node1/event", "{}")
             if allowed != 1:
                 raise AssertionError("Mosquitto ACL denied the node's own event publish")
@@ -206,11 +230,9 @@ def run(args: argparse.Namespace) -> int:
             if __import__("re").search(r"(?i)Received PUBLISH[^\r\n]*node1/ack", broker_text):
                 raise AssertionError("Mosquitto log indicates the node's forged ACK publish was accepted")
             record("mosquitto_node_acl", status="PASS", own_event_publish=allowed,
-                   own_ack_subscribe=own, other_ack_subscribe=other, forged_ack_denied=True)
+                   own_ack_subscribe=own, other_ack_subscribe=other,
+                   cross_device_ack_delivered=False, forged_ack_denied=True)
 
-            gateway, rc = security.mqtt_client(port, trusted, "gateway-test", credentials["gateway-test"])
-            if rc != 0:
-                raise AssertionError(f"Mosquitto rejected valid gateway credentials with CONNACK {rc}")
             event_grant = security.subscribe(gateway, "home/security-test/device/+/event")
             if event_grant not in (0, 1):
                 raise AssertionError("Mosquitto denied gateway event wildcard subscription")

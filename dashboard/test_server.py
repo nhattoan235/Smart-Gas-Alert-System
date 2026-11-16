@@ -55,6 +55,56 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(server.ingest(self.topic.replace("telemetry", "event"), json.dumps(event).encode()))
         self.assertEqual(len(server.events()), 1)
 
+    def test_flame_event_opens_and_closes_independent_incident(self):
+        topic = self.topic.replace("telemetry", "event")
+        opened = {**self.message, "kind": "event", "seq": 2,
+                  "flame_channel": "F2", "flame_cause": "F2_FLAME_LOST",
+                  "flame_active": True, "burner_id": "burner1"}
+        self.assertTrue(server.ingest(topic, json.dumps(opened).encode()))
+        incidents = server.incidents()
+        self.assertEqual(len(incidents), 1)
+        self.assertEqual(incidents[0]["channel"], "F2")
+        self.assertEqual(incidents[0]["cause"], "F2_FLAME_LOST")
+        self.assertEqual(incidents[0]["gas"], "flame")
+        self.assertEqual(server.queue_expired_notifications(time.time() + 1000), 0)
+
+        closed = {**opened, "seq": 3, "flame_active": False}
+        self.assertTrue(server.ingest(topic, json.dumps(closed).encode()))
+        incidents = server.incidents()
+        self.assertIsNotNone(incidents[0]["closed_at"])
+        self.assertEqual(len(incidents), 1)
+
+    def test_flame_event_validation_requires_consistent_channel_fields(self):
+        topic = self.topic.replace("telemetry", "event")
+        event = {**self.message, "kind": "event", "seq": 2,
+                 "flame_channel": "F1", "flame_cause": "F1_FIRE",
+                 "flame_active": True}
+        self.assertTrue(server.validate(topic, event))
+        event["burner_id"] = "burner1"
+        self.assertFalse(server.validate(topic, event))
+        event.pop("burner_id")
+        event["flame_cause"] = "F2_FLAME_LOST"
+        self.assertFalse(server.validate(topic, event))
+        event = {**self.message, "kind": "event", "seq": 3,
+                 "flame_channel": "F1", "flame_cause": "F1_SENSOR_FAULT",
+                 "flame_active": True, "flame_severity": "FAULT"}
+        self.assertTrue(server.validate(topic, event))
+        self.assertTrue(server.ingest(topic, json.dumps(event).encode()))
+        incident = server.incidents()[0]
+        self.assertEqual(incident["channel"], "F1")
+        self.assertEqual(incident["cause"], "F1_SENSOR_FAULT")
+        self.assertEqual(incident["gas"], "flame")
+        self.assertEqual(incident["state"], "FAULT")
+        self.assertEqual(server.queue_expired_notifications(time.time() + 1000), 0)
+
+    def test_flame_telemetry_fields_are_optional_and_typed(self):
+        self.assertTrue(server.validate(self.topic, self.message))
+        sample = {**self.message, "f1_flame": None, "f2_flame": False,
+                  "burner1_gas_state": True, "f2_state": "IGNITION_WAIT"}
+        self.assertTrue(server.validate(self.topic, sample))
+        sample["f1_flame"] = "unknown"
+        self.assertFalse(server.validate(self.topic, sample))
+
     def test_device_commit_ack_is_separate_from_server_sync_ack(self):
         event = {**self.message, "kind": "event", "seq": 2, "state": "WARNING", "changed_gas": "LPG",
                  "lpg": {**self.message["lpg"], "state": "WARNING"}}

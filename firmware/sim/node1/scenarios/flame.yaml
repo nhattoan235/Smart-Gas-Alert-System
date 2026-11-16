@@ -1,0 +1,90 @@
+name: 'Node 1 F1 and F2 flame monitoring'
+version: 1
+author: 'Smart Gas Alert automated tests'
+steps:
+  - set-control:
+      part-id: lpg
+      name: position
+      value: 0.03
+  - set-control:
+      part-id: co
+      name: position
+      value: 0.03
+  - set-control:
+      part-id: temp
+      name: position
+      value: 0.45
+  - set-control:
+      part-id: humid
+      name: position
+      value: 0.50
+  - set-control:
+      part-id: interference
+      name: position
+      value: 0.50
+  - wait-serial: 'node1: LPG SAFE'
+  - set-control:
+      part-id: f1
+      name: pressed
+      value: 1
+  - wait-serial: 'flame_event channel=F1 cause=F1_FIRE active=1'
+  - expect-pin:
+      part-id: esp
+      name: '7'
+      value: 1
+  - set-control:
+      part-id: f1
+      name: pressed
+      value: 0
+  - wait-serial: 'flame_event channel=F1 cause=F1_FIRE active=0'
+  - set-control:
+      part-id: burner1Gas
+      name: pressed
+      value: 1
+  - wait-serial: 'flame_event channel=F2 cause=F2_IGNITION_TIMEOUT active=1'
+  - set-control:
+      part-id: burner1Gas
+      name: pressed
+      value: 0
+  - wait-serial: 'flame_event channel=F2 cause=F2_IGNITION_TIMEOUT active=0'
+  - set-control:
+      part-id: burner1Gas
+      name: pressed
+      value: 1
+  - set-control:
+      part-id: f2
+      name: pressed
+      value: 1
+  - delay: 1000ms
+  - set-control:
+      part-id: f2
+      name: pressed
+      value: 0
+  - wait-serial: 'flame_event channel=F2 cause=F2_FLAME_LOST active=1'
+  - set-control:
+      part-id: lpg
+      name: position
+      value: 0.80
+  - wait-serial: 'node1: LPG DANGER'
+  - set-control:
+      part-id: burner1Gas
+      name: pressed
+      value: 0
+  - wait-serial: 'flame_event channel=F2 cause=F2_FLAME_LOST active=0'
+  - expect-pin:
+      part-id: esp
+      name: '7'
+      value: 1
+  - set-control:
+      part-id: lpg
+      name: position
+      value: 0.03
+  - wait-serial: 'node1: LPG WATCH'
+  - expect-pin:
+      part-id: esp
+      name: '6'
+      value: 1
+  - expect-pin:
+      part-id: esp
+      name: '7'
+      value: 0
