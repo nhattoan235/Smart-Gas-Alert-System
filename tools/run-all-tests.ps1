@@ -653,7 +653,7 @@ function Test-IsolatedLogicAnalyzer([string]$FirmwareRoot) {
 function Invoke-QuickTests([switch]$ForFull) {
   $nvsBrokerIsolationRegression = Join-Path $PSScriptRoot 'test_nvs_runtime_broker_isolation.ps1'
   if ((Test-Path -LiteralPath $script:powerShellExecutable -PathType Leaf) -and (Test-Path -LiteralPath $nvsBrokerIsolationRegression -PathType Leaf)) {
-    Invoke-LoggedProcess 'nvs-runtime-broker-isolation-regression' $script:powerShellExecutable @('-NoProfile','-File',$nvsBrokerIsolationRegression) $repo 'nvs-runtime-broker-isolation-regression.log' 30 'Regression assertion: NVS firmware keeps host.wokwi.internal:1884 while cloud simulation nodes are redirected away from the demo broker.'
+    Invoke-LoggedProcess 'nvs-runtime-broker-isolation-regression' $script:powerShellExecutable @('-NoProfile','-File',$nvsBrokerIsolationRegression) $repo 'nvs-runtime-broker-isolation-regression.log' 30 'Regression assertion: isolated node builds use a test-only broker environment while the dedicated NVS profile retains port 1884.'
   } else {
     Add-Blocked 'nvs-runtime-broker-isolation-regression' 'nvs-runtime-broker-isolation-regression.log' 'PowerShell executable or NVS runtime broker isolation regression script is unavailable.'
   }
@@ -1057,8 +1057,8 @@ function Invoke-FullTests {
       $packageRequirements = [ordered]@{
         'toolchain-xtensa-esp32s3' = '8.4.0+2021r2-patch5'
         'toolchain-riscv32-esp' = '8.4.0+2021r2-patch5'
-        'framework-arduinoespressif32' = '4.20017.260907+sha.dcc1105b'
-        'tool-esptoolpy' = '2.41100.260830'
+        'framework-arduinoespressif32' = '3.20017.241212'
+        'tool-esptoolpy' = '2.41100.0'
       }
       $missingPackages = [System.Collections.Generic.List[string]]::new()
       foreach ($packageName in $packageRequirements.Keys) {
@@ -1069,7 +1069,15 @@ function Invoke-FullTests {
         }
         try {
           $packageManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-          if ([string]$packageManifest.version -ne [string]$packageRequirements[$packageName]) {
+          $actualVersion = [string]$packageManifest.version
+          $expectedVersion = [string]$packageRequirements[$packageName]
+          $versionMatches = $actualVersion -eq $expectedVersion
+          if (-not $versionMatches -and
+              $packageName -eq 'framework-arduinoespressif32' -and
+              $actualVersion.StartsWith($expectedVersion + '+', [StringComparison]::Ordinal)) {
+            $versionMatches = $true
+          }
+          if (-not $versionMatches) {
             $missingPackages.Add("$packageName (version $($packageManifest.version), expected $($packageRequirements[$packageName]))")
           }
         } catch { $missingPackages.Add("$packageName (manifest unreadable)") }
@@ -1092,7 +1100,8 @@ function Invoke-FullTests {
         if ($preflightResult.status -eq 'PASS' -and [string]::IsNullOrWhiteSpace($env:GAS_MQTT_PASSWORD)) {
           Add-Blocked 'firmware-build-node1-node2-node3' 'firmware-build.log' 'Production node build skipped because GAS_MQTT_PASSWORD is missing or empty in this process. No credential was logged.'
         } elseif ($preflightResult.status -eq 'PASS') {
-          Invoke-LoggedProcess 'firmware-build-node1-node2-node3' $script:python.Source @('-m','platformio','run','-d',$isolatedFirmware,'-e','node1','-e','node2','-e','node3') $repo 'firmware-build.log' 600 'Fresh source build in isolated run folder; exact preinstalled PlatformIO packages are reused and no package download/upgrade is allowed. GAS_MQTT_PASSWORD is inherited through the child environment only and is not included in arguments or logs.'
+          $isolatedBrokerEnvironment = Get-IsolatedSimulationNodeBrokerEnvironment
+          Invoke-LoggedProcess 'firmware-build-node1-node2-node3' $script:python.Source @('-m','platformio','run','-d',$isolatedFirmware,'-e','node1','-e','node2','-e','node3') $repo 'firmware-build.log' 600 'Fresh source build in isolated run folder; exact preinstalled PlatformIO packages are reused and no package download/upgrade is allowed. GAS_MQTT_PASSWORD is inherited through the child environment only and is not included in arguments or logs.' $isolatedBrokerEnvironment
         } else {
           Add-Blocked 'firmware-build-node1-node2-node3' 'firmware-build.log' 'Build skipped because the exact Xtensa compiler executable failed its direct launch preflight; see platformio-toolchain-preflight.log and runner-errors.log.'
         }

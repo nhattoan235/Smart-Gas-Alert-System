@@ -113,8 +113,13 @@ function Set-IsolatedSimulationNodeBroker {
   $baseConfig = $PlatformIoText.Substring(0, $runtimeIndex)
   $protectedConfig = $PlatformIoText.Substring($runtimeIndex)
   $baseConfig = $baseConfig.Replace('demo-home', $TestHomeId)
-  $baseConfig = $baseConfig.Replace('MQTT_HOST="host.wokwi.internal"', 'MQTT_HOST="autotest.invalid"')
-  $baseConfig = $baseConfig.Replace('MQTT_PORT=1883', 'MQTT_PORT=1884')
-  $baseConfig = $baseConfig.Replace('MQTT_USER="iotlab"', 'MQTT_USER="autotest"')
   return $baseConfig + $protectedConfig
+}
+
+function Get-IsolatedSimulationNodeBrokerEnvironment {
+  return @{
+    MQTT_HOST = 'autotest.invalid'
+    MQTT_PORT = '1884'
+    MQTT_USER = 'autotest'
+  }
 }

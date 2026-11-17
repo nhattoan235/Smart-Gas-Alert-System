@@ -740,6 +740,7 @@ static void mqttWorker(void *) {
       if(now-lastConnectAttempt>=3000) {
         lastConnectAttempt=now;
         String will=String("{\"device_id\":\"")+DEVICE_ID+"\",\"online\":false}";
+        // MQTT_HOST/PORT/USER được mqtt_build.py đưa vào lúc build; Wokwi cần Private IoT Gateway tới VM.
         if(mqtt.connect(MQTT_HOST,MQTT_PORT,DEVICE_ID,MQTT_USER,MQTT_PASSWORD,
                         (prefix+"availability").c_str(),will.c_str())) {
           mqtt.subscribe((prefix+"ack").c_str());

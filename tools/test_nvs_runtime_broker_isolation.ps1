@@ -1,13 +1,10 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'nvs_runtime_wokwi_config.ps1')
 
-$sample = @'
+$sample = @"
 default_envs = node1, node2, node3
 [env]
   -D HOME_ID="demo-home"
-  -D MQTT_HOST="host.wokwi.internal"
-  -D MQTT_PORT=1883
-  -D MQTT_USER="iotlab"
 [env:node1]
   -D DEVICE_ID="node1"
 ; Isolated local Wokwi runtime target
@@ -16,23 +13,29 @@ default_envs = node1, node2, node3
   -D MQTT_HOST="host.wokwi.internal"
   -D MQTT_PORT=1884
   -D MQTT_USER="nvs-runtime-test"
-'@
-$legacyRewrite = $sample.Replace('MQTT_HOST="host.wokwi.internal"','MQTT_HOST="autotest.invalid"').Replace('MQTT_PORT=1883','MQTT_PORT=1884')
-$legacyRuntime = $legacyRewrite.Substring($legacyRewrite.IndexOf('; Isolated local Wokwi runtime target', [System.StringComparison]::Ordinal))
-if ($legacyRuntime -notmatch 'MQTT_HOST="autotest.invalid"') {
-  throw 'Baseline regression setup failed: the previous global replacement did not reproduce the runtime host corruption.'
-}
+"@
 $actual = Set-IsolatedSimulationNodeBroker -PlatformIoText $sample -TestHomeId 'autotest-case'
-$runtime = $actual.Substring($actual.IndexOf('; Isolated local Wokwi runtime target', [System.StringComparison]::Ordinal))
-if ($actual -notmatch 'HOME_ID="autotest-case"' -or
-    $actual -notmatch 'MQTT_HOST="autotest.invalid"' -or
-    $actual -notmatch 'MQTT_USER="autotest"') {
-  throw 'Base simulation nodes were not redirected to isolated test broker settings.'
+$runtimeMarker = '; Isolated local Wokwi runtime target'
+$runtimeIndex = $actual.IndexOf($runtimeMarker, [System.StringComparison]::Ordinal)
+if ($runtimeIndex -lt 0) {
+  throw 'Isolated NVS runtime profile marker was lost.'
 }
-if ($runtime -notmatch 'HOME_ID="nvs-runtime-test"' -or
-    $runtime -notmatch 'MQTT_HOST="host.wokwi.internal"' -or
-    $runtime -notmatch 'MQTT_PORT=1884' -or
-    $runtime -notmatch 'MQTT_USER="nvs-runtime-test"') {
-  throw 'Regression: isolated NVS runtime target lost its Private Gateway host or port 1884 configuration.'
+$base = $actual.Substring(0, $runtimeIndex)
+$runtime = $actual.Substring($runtimeIndex)
+$brokerEnvironment = Get-IsolatedSimulationNodeBrokerEnvironment
+
+if (-not $base.Contains('autotest-case') -or $base -match 'MQTT_HOST|MQTT_PORT|MQTT_USER') {
+  throw 'Normal node config must isolate HOME_ID while taking broker settings from the environment.'
 }
-Write-Output 'PASS: reproduced the previous global replacement corruption, then verified cloud isolation preserves the NVS runtime endpoint.'
+if ($brokerEnvironment.MQTT_HOST -ne 'autotest.invalid' -or
+    $brokerEnvironment.MQTT_PORT -ne '1884' -or
+    $brokerEnvironment.MQTT_USER -ne 'autotest') {
+  throw 'Normal node builds were not assigned the isolated test broker environment.'
+}
+if (-not $runtime.Contains('HOME_ID="nvs-runtime-test"') -or
+    -not $runtime.Contains('MQTT_HOST="host.wokwi.internal"') -or
+    -not $runtime.Contains('MQTT_PORT=1884') -or
+    -not $runtime.Contains('MQTT_USER="nvs-runtime-test"')) {
+  throw 'Regression: isolated NVS runtime target lost its private-gateway endpoint or test credentials.'
+}
+Write-Output 'PASS: node builds receive an isolated broker environment and the NVS runtime profile keeps its separate endpoint.'

@@ -23,7 +23,8 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("GAS_DB", str(ROOT / "gas_sentinel.sqlite3")))
-MQTT_HOST = os.environ.get("MQTT_HOST", "127.0.0.1")
+# start-local.ps1 nạp các giá trị này từ .env để dashboard dùng cùng broker với firmware.
+MQTT_HOST = os.environ.get("MQTT_HOST", "192.168.22.128")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "iotlab")
 MQTT_PASSWORD = os.environ.get("GAS_MQTT_PASSWORD", os.environ.get("MQTT_PASSWORD", ""))
@@ -961,6 +962,7 @@ def recv_packet(sock: socket.socket) -> tuple[int, bytes]:
     raise ValueError("bad MQTT remaining length")
 
 
+# Worker này kết nối tới broker và tự kết nối lại nếu đường truyền bị gián đoạn.
 def mqtt_worker() -> None:
     global MQTT_CONNECTED
     while True:

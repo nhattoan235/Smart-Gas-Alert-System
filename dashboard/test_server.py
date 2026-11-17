@@ -473,9 +473,12 @@ class QuietHandler(server.Handler):
 httpd = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
 serve_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
 serve_thread.start()
-with open(os.environ["GAS_TEST_READY_FILE"], "w", encoding="ascii") as ready:
+ready_path = os.environ["GAS_TEST_READY_FILE"]
+temporary_ready_path = ready_path + ".tmp"
+with open(temporary_ready_path, "w", encoding="ascii") as ready:
     ready.write(str(httpd.server_port))
     ready.flush()
+os.replace(temporary_ready_path, ready_path)
 sys.stdin.read()
 httpd.shutdown()
 httpd.server_close()
